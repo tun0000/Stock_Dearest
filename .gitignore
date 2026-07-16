@@ -1,0 +1,16 @@
+node_modules/
+coverage/
+.data/
+.data-preview/
+log/
+*.log
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+npm-debug.log*
+.claude/settings.local.json
+.impeccable/

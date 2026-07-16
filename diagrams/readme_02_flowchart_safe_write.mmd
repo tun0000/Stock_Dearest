@@ -1,0 +1,44 @@
+flowchart TD
+    Start(["📥 收到資料修改請求"])
+    Guard["🛡️ 檢查 method、Origin、Content-Type 與輸入"]
+    EntryAuth{"🔐 入口權限與格式有效？"}
+    Reject4xx["❌ 回傳 401 / 403 / 409 / 422<br/>不進入寫入佇列"]
+    Queue["⏳ 進入 transaction queue<br/>依序處理；讀取仍看上一個已提交版本"]
+    Recheck["🔐 以最新 DB 重驗<br/>session、user、角色與 rev"]
+    Current{"資料與權限仍有效？"}
+    RejectCurrent["❌ 回傳 401 / 403 / 409<br/>不產生 draft"]
+    Draft["📄 複製已提交 dbCache<br/>建立隔離 draft"]
+    Mutate["⚙️ 在 draft 套用修改與 canonicalization"]
+    Persist["💾 saveDb + writeFileAtomic<br/>先安全落盤"]
+    Saved{"原子寫入成功？"}
+    Discard["🗑️ 丟棄未提交 draft<br/>已提交版本與 rev 保持不變"]
+    Failure["⚠️ 回傳 503<br/>PERSISTENCE_FAILED"]
+    Publish["✅ 發布新 dbCache 與 rev"]
+    Success(["📤 回傳 canonical 成功結果"])
+
+    Start --> Guard
+    Guard --> EntryAuth
+    EntryAuth -->|"否"| Reject4xx
+    EntryAuth -->|"是"| Queue
+    Queue --> Recheck
+    Recheck --> Current
+    Current -->|"否"| RejectCurrent
+    Current -->|"是"| Draft
+    Draft --> Mutate
+    Mutate --> Persist
+    Persist --> Saved
+    Saved -->|"否"| Discard
+    Discard --> Failure
+    Saved -->|"是"| Publish
+    Publish --> Success
+
+    classDef startEnd fill:#D0EBFF,stroke:#1971C2,stroke-width:2px,color:#0B1F33
+    classDef process fill:#D3F9D8,stroke:#2B8A3E,stroke-width:2px,color:#102A14
+    classDef decision fill:#FFF3BF,stroke:#E67700,stroke-width:2px,color:#3B2F00
+    classDef error fill:#FFE3E3,stroke:#C92A2A,stroke-width:2px,color:#3B1111
+    classDef data fill:#E5DBFF,stroke:#6741D9,stroke-width:2px,color:#211A3A
+
+    class Start,Success startEnd
+    class Guard,Queue,Recheck,Draft,Mutate,Persist,Publish process
+    class EntryAuth,Current,Saved decision
+    class Reject4xx,RejectCurrent,Discard,Failure error

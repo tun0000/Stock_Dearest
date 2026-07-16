@@ -1,0 +1,56 @@
+flowchart TD
+    subgraph ExportFlow["匯出"]
+        User(["👤 已登入使用者"])
+        ExportApi["📤 GET /api/personal-data/export"]
+        Scope["🔐 只收集目前帳號的 canonical 個資<br/>排除密碼、session、券商憑證與他人資料"]
+        Bundle["📦 產生 JSON bundle<br/>版本、摘要與 SHA-256 checksum"]
+    end
+
+    subgraph RestoreFlow["預覽與復原"]
+        SelectFile["📥 使用者選擇備份檔"]
+        LocalCheck["🛡️ 前端預檢<br/>非空、JSON、格式、版本、16 MiB 上限"]
+        PreviewApi["🔎 POST /api/personal-data/restore/preview<br/>驗 checksum、契約並 canonicalize"]
+        Valid{"備份內容有效？"}
+        RejectPreview["❌ 回傳 422<br/>資料完全不變"]
+        Preview["📋 顯示 dry-run 差異摘要<br/>核發 10 分鐘一次性 token"]
+        Confirm["🔐 輸入目前密碼<br/>勾選確認並輸入 RESTORE"]
+        RestoreApi["⚙️ POST /api/personal-data/restore"]
+        Recheck["🔐 提交時重驗最新 session、密碼<br/>個人 rev 與共享備註 rev"]
+        Fresh{"token 與資料狀態仍有效？"}
+        RejectCommit["❌ 回傳 401 / 409<br/>必須重新預覽"]
+        RestorePoint["💾 建立完整 DB 還原點"]
+        Apply["🔄 原子取代私人資料<br/>安全合併自己的共享備註"]
+        Complete(["✅ token 失效<br/>重新載入 canonical 資料"])
+    end
+
+    User --> ExportApi
+    ExportApi --> Scope
+    Scope --> Bundle
+    Bundle --> SelectFile
+    SelectFile --> LocalCheck
+    LocalCheck --> PreviewApi
+    PreviewApi --> Valid
+    Valid -->|"否"| RejectPreview
+    Valid -->|"是"| Preview
+    Preview --> Confirm
+    Confirm --> RestoreApi
+    RestoreApi --> Recheck
+    Recheck --> Fresh
+    Fresh -->|"否"| RejectCommit
+    Fresh -->|"是"| RestorePoint
+    RestorePoint --> Apply
+    Apply --> Complete
+
+    classDef actor fill:#FFF3BF,stroke:#E67700,stroke-width:2px,color:#3B2F00
+    classDef process fill:#D3F9D8,stroke:#2B8A3E,stroke-width:2px,color:#102A14
+    classDef decision fill:#FFF3BF,stroke:#E67700,stroke-width:2px,color:#3B2F00
+    classDef error fill:#FFE3E3,stroke:#C92A2A,stroke-width:2px,color:#3B1111
+    classDef data fill:#E5DBFF,stroke:#6741D9,stroke-width:2px,color:#211A3A
+    classDef success fill:#D0EBFF,stroke:#1971C2,stroke-width:2px,color:#0B1F33
+
+    class User actor
+    class ExportApi,Scope,LocalCheck,PreviewApi,Preview,Confirm,RestoreApi,Recheck,Apply process
+    class Valid,Fresh decision
+    class RejectPreview,RejectCommit error
+    class Bundle,RestorePoint data
+    class Complete success

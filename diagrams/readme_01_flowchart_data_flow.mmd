@@ -1,0 +1,42 @@
+flowchart LR
+    subgraph DataSources["外部資料源"]
+        Official["☁️ TWSE / TPEx<br/>MIS + OpenAPI"]
+        Futures["☁️ 期交所<br/>MIS + 日報"]
+        Yahoo["☁️ Yahoo<br/>行情備援"]
+        Fubon["🔐 富邦 API<br/>使用者設定後只讀行情"]
+    end
+
+    subgraph Stock1Core["Stock1 本機服務"]
+        Normalize["🔄 正規化與來源標記<br/>TTL、single-flight、last-good"]
+        LocalData["💾 .data/<br/>主 DB、備份、持久化快取"]
+        API["⚙️ server.mjs<br/>同源 /api/* JSON"]
+    end
+
+    subgraph ClientSide["使用端"]
+        SW["📦 Service Worker<br/>只快取 app shell"]
+        UI["🌐 瀏覽器 / PWA<br/>index.html + app.js<br/>state + render"]
+        User(["👤 使用者"])
+    end
+
+    Official -->|"官方行情與主檔"| Normalize
+    Futures -->|"期貨行情"| Normalize
+    Yahoo -.->|"官方即時價不可用時"| Normalize
+    Fubon -.->|"選用券商來源時"| Normalize
+    Normalize <--> LocalData
+    Normalize --> API
+    API -->|"canonical JSON + warnings"| UI
+    UI --> User
+    SW -->|"離線 app shell"| UI
+    SW -.->|"API 永不快取"| API
+
+    classDef actor fill:#FFF3BF,stroke:#E67700,stroke-width:2px,color:#3B2F00
+    classDef frontend fill:#D0EBFF,stroke:#1971C2,stroke-width:2px,color:#0B1F33
+    classDef backend fill:#D3F9D8,stroke:#2B8A3E,stroke-width:2px,color:#102A14
+    classDef data fill:#E5DBFF,stroke:#6741D9,stroke-width:2px,color:#211A3A
+    classDef external fill:#FFE3E3,stroke:#C92A2A,stroke-width:2px,color:#3B1111
+
+    class User actor
+    class UI,SW frontend
+    class API,Normalize backend
+    class LocalData data
+    class Official,Futures,Yahoo,Fubon external
