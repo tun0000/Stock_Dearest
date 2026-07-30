@@ -23,6 +23,88 @@ function scaleAfter(rows, index, ratio) {
   });
 }
 
+// 這幾筆是 2026-07-25 從實機 fundamentals-cache.json 抄下來的真實形狀。
+// 官方對「沒有現增」的表達就是把現增欄位留空，配股不配現增又是除權息的常態
+// （實測 59 筆除權事件裡 31 筆長這樣），所以它必須是可以精確還原的完整公告。
+test("官方常態形狀：配股不配現增（現增欄位為 null）必須算得出精確參考價", () => {
+  const previousClose = 100;
+  const stockOnly = {
+    exDate: "20260730",
+    kind: "除權息",
+    cashDividend: 1.5,
+    stockRatio: 0.09999999,
+    subscriptionRatio: null,
+    subscriptionPrice: null,
+  };
+  const ratio = officialCorporateActionRatio(stockOnly, previousClose);
+  const expected = (previousClose - 1.5) / (1 + 0.09999999) / previousClose;
+  assert.ok(ratio !== null, "把這種常態公告判成「公式不齊」會讓過半配股公司被踢出波段板");
+  assert.ok(Math.abs(ratio - expected) < 1e-12, `${ratio} 應為 ${expected}`);
+
+  // 真的有現增時官方兩個欄位都會填，照樣精確。
+  const withRights = {
+    exDate: "20260721",
+    kind: "除權息",
+    cashDividend: 0.5,
+    stockRatio: 0.04999999,
+    subscriptionRatio: 0.25790632,
+    subscriptionPrice: 15,
+  };
+  const rightsRatio = officialCorporateActionRatio(withRights, previousClose);
+  const rightsExpected = (previousClose - 0.5 + 15 * 0.25790632) / (1 + 0.04999999 + 0.25790632) / previousClose;
+  assert.ok(Math.abs(rightsRatio - rightsExpected) < 1e-12);
+});
+
+// D-41 的防護網。單位已於 2026-07-26 實測確認是「比率」，但上游若改版成「每仟股股數」，
+// 除數會從 1.1 變成 101，整段 K 線塌陷卻仍蓋著 official 章、不走 heuristic、毫無告警。
+test("配股率量級異常（>100%）一律擋下標未定案，不得無聲算出塌掉的線", () => {
+  const previousClose = 100;
+  // 上游改成每仟股股數的災難形狀：0.1 變成 100。
+  assert.equal(
+    officialCorporateActionRatio(
+      { exDate: "20260730", kind: "除權", cashDividend: 0, stockRatio: 100, subscriptionRatio: 0, subscriptionPrice: 0 },
+      previousClose,
+    ),
+    null,
+    "若放行，參考價會變成 100/101≈0.99 元，事件前整段歷史被壓成 1%",
+  );
+  assert.equal(
+    officialCorporateActionRatio(
+      { exDate: "20260730", kind: "除權", cashDividend: 0, stockRatio: 0, subscriptionRatio: 250, subscriptionPrice: 15 },
+      previousClose,
+    ),
+    null,
+    "現增比率同樣要防",
+  );
+  // 邊界：配股 100%（1:1 無償配股）合法且真的存在，不可誤擋。
+  const legit = officialCorporateActionRatio(
+    { exDate: "20260730", kind: "除權", cashDividend: 0, stockRatio: 1, subscriptionRatio: 0, subscriptionPrice: 0 },
+    previousClose,
+  );
+  assert.ok(Math.abs(legit - 0.5) < 1e-12, `1:1 配股的因子應為 0.5，實際 ${legit}`);
+});
+
+test("除權但兩個比率都拿不到值：仍然不得硬算", () => {
+  const previousClose = 100;
+  // 兩欄全 null → 完全不知道配了多少，只能標 unresolved。
+  assert.equal(
+    officialCorporateActionRatio(
+      { exDate: "20260730", kind: "除權", cashDividend: 0, stockRatio: null, subscriptionRatio: null, subscriptionPrice: null },
+      previousClose,
+    ),
+    null,
+  );
+  // 現增明確是 0、配股率卻缺漏 → 兩個比率相加為 0 的「除權」在定義上不成立，
+  // 不能算出 ratio=1 卻蓋上 official 章（那會在還原序列裡留下一根真實的除權假崩盤）。
+  assert.equal(
+    officialCorporateActionRatio(
+      { exDate: "20260730", kind: "除權", cashDividend: 0, stockRatio: null, subscriptionRatio: 0, subscriptionPrice: 0 },
+      previousClose,
+    ),
+    null,
+  );
+});
+
 test("現增認購比率 >0 但認購價為 null：不得冒充 official，大缺口才可降級 heuristic", () => {
   const raw = candles({ n: 100, base: 100, drift: 0, wobble: 1 });
   const gapAt = 90;
