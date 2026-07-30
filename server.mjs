@@ -341,9 +341,21 @@ function parseCookies(cookieHeader = "") {
     .reduce((cookies, part) => {
       const index = part.indexOf("=");
       if (index === -1) return cookies;
-      const key = decodeURIComponent(part.slice(0, index));
-      const value = decodeURIComponent(part.slice(index + 1));
-      cookies[key] = value;
+      // decodeURIComponent 對「裸 %」會丟 URIError（例如值裡有 "100%" 或 "50%off"）。
+      // 這個函式被 getAuthContext 在**每一支 API 之前**呼叫，所以一個解不開的 cookie
+      // 會讓整個 /api/* 回 500 URI malformed：畫面每一格「載入失敗」，
+      // 而且自選股與交易紀錄的 PUT 也全部失敗、資料存不進去。
+      //
+      // 更麻煩的是 cookie 綁 host 不綁 port——同一台機器上**任何其他 localhost 專案**
+      // 寫過一次這種 cookie 就會波及這裡，與本專案的 sid 完全無關，使用者不可能查得出原因。
+      //
+      // 解不開的那一筆直接跳過（等同「沒有這個 cookie」）：最壞情況是視同未登入，
+      // 遠好過整個 API 掛掉。其餘 cookie 照常解析，不會被一顆壞的拖累。
+      try {
+        cookies[decodeURIComponent(part.slice(0, index))] = decodeURIComponent(part.slice(index + 1));
+      } catch {
+        // 忽略這一筆
+      }
       return cookies;
     }, {});
 }
@@ -493,6 +505,22 @@ function capacityValidationError(message, details) {
 const TRADE_FEE_RATE = 0.001425; // 只作預設估算基準；實際費率、折讓與最低費用由券商自訂。
 // 舊版相容常數；v2 正式估算改走 effective-dated computeTradeTaxRule()。
 const TRADE_TAX_RATES = { stock: 0.003, etf: 0.001, dayTrade: 0.0015 };
+
+// ---- 前向驗證／回測的交易成本估算（D-20）----
+// 驗證單與回測樣本只有價格，沒有股數或部位金額，所以只能做**費率版**淨報酬：
+// 買進手續費＋賣出手續費（各 TRADE_FEE_RATE × 預設折數）＋賣出證交稅（一般股票 3‰）。
+// 因此它**套不上 computeTradeFee 的每筆最低 20 元**——成交金額低於約 23,400 元時實際費率更高，
+// 小額部位的真實成本會比這個數字大。也不等同交易帳本口徑，文案一律標「估算」。
+// 隔日沖是「今日收盤買、次日賣」，不是現股當沖，所以用全額 3‰ 而非減半的 1.5‰。
+const VERIFY_ROUND_TRIP_FEE_PCT = TRADE_FEE_RATE * 0.6 * 2 * 100;   // 0.171%
+const VERIFY_ROUND_TRIP_TAX_PCT = TRADE_TAX_RATES.stock * 100;       // 0.3%
+const VERIFY_ROUND_TRIP_COST_PCT = roundTo(VERIFY_ROUND_TRIP_FEE_PCT + VERIFY_ROUND_TRIP_TAX_PCT, 3); // 0.471%
+const VERIFY_COST_NOTE = `淨報酬為估算：已扣一買一賣的手續費與證交稅合計約 ${VERIFY_ROUND_TRIP_COST_PCT}%`
+  + "（以預設 0.6 折、一般股票 3‰ 計；未計每筆最低 20 元手續費與滑價，小額部位實際成本更高）。";
+// 毛報酬扣成本；null 進 null 出，不可讓缺值變成 -0.471。
+function netReturnPct(grossPct) {
+  return Number.isFinite(grossPct) ? roundTo(grossPct - VERIFY_ROUND_TRIP_COST_PCT) : null;
+}
 const TRADE_SCHEMA_VERSION = 2;
 const TRADE_INSTRUMENT_TYPES = new Set([
   "stock",
@@ -587,6 +615,33 @@ function isConfirmedDayTradeStatus(status) {
   return status === "brokerConfirmed" || status === "userConfirmed";
 }
 
+// 現股當沖減半的合格股數必須是一個交易單位（1,000 股）的整數倍。
+//
+// 法源（2026-07-26 查證官方原文，不是二手新聞）：
+//   《證券交易稅條例》§2-2 明文「適用前項規定稅率之股票交易，應依金融主管機關、證券交易所、
+//     證券櫃檯買賣中心訂定之**有價證券當日沖銷交易作業相關規定**辦理」→ 作業辦法被稅法引用。
+//   《有價證券當日沖銷交易作業辦法》§1 第 4 項：「**零股**、鉅額買賣、依證券交易所營業細則
+//     第七十四條之交易…**不適用本辦法**。」TWSE「當日沖銷交易專區」同文。
+//   普通交易與盤後定價交易的買賣單位都是 1,000 股，而「零股」的定義就是不足一個交易單位；
+//   零股既然被排除，合格的沖銷數量必然是 1,000 的整數倍。
+//
+// ⚠ 最後一步是**推論**——法規沒有直接寫「配對股數必須是 1000 的倍數」。所以這個函式只用來
+//   (a) 保守估稅：不足一整股單位的部分不給減半（與債券 ETF 缺官方 stamp 時「先按一般稅率估、
+//       要求覆核」同一套處理），以及 (b) 標記待覆核讓使用者拿對帳單核對。**不硬擋輸入**，
+//   因為券商實際稅額永遠優先，而且擋掉合法輸入的代價比高估稅額大。
+//
+// 順帶記錄兩件查證結果，避免後人重查或誤修：
+//   • **盤後定價交易可以當沖**：作業辦法 §1 第 3 項「以普通交易收盤前之買賣間**及普通交易
+//     收盤前之買賣與盤後定價交易間**之反向沖銷者為限」。所以 `afterHoursFixed` 不該被擋。
+//   • **優惠期間到民國 116 年（2027）12 月 31 日**，`STOCK_DAY_TRADE_TAX_TO` 目前正確。
+//     網路上仍能查到「到 2026 年底」的說法，那是舊版修法，已再次延長，不要照著改。
+const STOCK_TRADING_UNIT_SHARES = 1000;
+function dayTradeEligibleShares(matchedShares) {
+  const shares = Number(matchedShares);
+  if (!Number.isInteger(shares) || shares <= 0) return 0;
+  return Math.floor(shares / STOCK_TRADING_UNIT_SHARES) * STOCK_TRADING_UNIT_SHARES;
+}
+
 // Effective-dated estimate only. Broker statement amounts always take precedence in normalization.
 function computeTradeTaxRule({
   side = "sell",
@@ -621,9 +676,16 @@ function computeTradeTaxRule({
     const inReliefPeriod = Boolean(tradeDate)
       && tradeDate >= STOCK_DAY_TRADE_TAX_FROM
       && tradeDate <= STOCK_DAY_TRADE_TAX_TO;
-    const dayTradeShares = inReliefPeriod ? requestedMatched : 0;
+    // 零股不適用當沖（作業辦法 §1(4)），所以不足一個交易單位的部分不給減半。
+    const eligibleMatched = dayTradeEligibleShares(requestedMatched);
+    const dayTradeShares = inReliefPeriod ? eligibleMatched : 0;
     if (requestedMatched > 0 && !inReliefPeriod) {
       warnings.push("成交日不在現股當沖減半課稅期間，已按一般股票稅率估算");
+    }
+    if (requestedMatched > eligibleMatched) {
+      const oddShares = requestedMatched - eligibleMatched;
+      warnings.push(`當沖配對股數 ${requestedMatched} 股不是 ${STOCK_TRADING_UNIT_SHARES} 股的整數倍，`
+        + `其中 ${oddShares} 股按一般稅率估算（零股不適用現股當沖）。請與券商對帳單核對。`);
     }
     if (dayTrade?.status === "legacyDeclared") {
       warnings.push("舊版當沖標記缺少券商、帳戶與配對股數，未自動套用優惠稅率");
@@ -692,6 +754,53 @@ function computeTradeTaxRule({
   };
 }
 
+// ---- 公司行動紀錄（D-22）----
+// 帳本原本只認 buy/sell/dividend，而 dividend 只有「每股現金 × 股數」一種語意、不動持股與成本。
+// 於是無償配股與現增之後，帳本的股數永遠停在配股前：
+//   (a) 顯示面——1000 股均價 100 的持股配股 10% 後，實際是 1100 股均價 90.91、未實現 0，
+//       帳本卻仍是 1000 股成本 100,000 配上 90.91 的現價 → 顯示未實現 −9,090（−9.1%）的假虧損；
+//   (b) 功能面（更嚴重）——買 1000 股、配股後實際持有 1100 股，想賣 1100 股會被
+//       buildPortfolio 的賣超檢查擋下，錯誤訊息還叫使用者「檢查買賣紀錄」，但紀錄是對的。
+// 會計上其實很單純：無償配股＝以 0 元取得股票，現增＝以認購價取得股票，兩者都只是
+// 「加股數、加成本」，均價自然稀釋。所以這裡只新增一種紀錄型別，portfolio 的數學保持單純。
+// 比率欄位刻意與官方歸檔（corporateActionHistoryForCode）一致，之後才能由官方資料直接帶入。
+// **減資尚未支援**：本機官方歸檔不涵蓋減資（見 stock1-domain），使用者得手填；而且現金減資的
+// 成本處理（沖減成本 vs 認列已實現）是會計口徑選擇，需要使用者拍板，不在這批。
+const TRADE_CORPORATE_ACTION_SIDE = "corporateAction";
+const TRADE_SIDES = new Set(["buy", "sell", "dividend", TRADE_CORPORATE_ACTION_SIDE]);
+function readCorporateActionRatios(raw) {
+  const num = (value) => {
+    if (value === null || value === undefined || String(value).trim() === "") return 0;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
+  };
+  return {
+    stockRatio: num(raw?.stockRatio),
+    subscriptionRatio: num(raw?.subscriptionRatio),
+    subscriptionPrice: num(raw?.subscriptionPrice),
+  };
+}
+// 回傳錯誤字串陣列；空陣列＝通過。驗證與正規化共用同一套規則，避免兩邊分岔。
+function corporateActionErrors(raw) {
+  const errors = [];
+  const { stockRatio, subscriptionRatio, subscriptionPrice } = readCorporateActionRatios(raw);
+  if (!Number.isFinite(stockRatio)) errors.push("無償配股率必須是 0 或正數");
+  if (!Number.isFinite(subscriptionRatio)) errors.push("現增配股率必須是 0 或正數");
+  if (!Number.isFinite(subscriptionPrice)) errors.push("現增認購價必須是 0 或正數");
+  if (Number.isFinite(stockRatio) && Number.isFinite(subscriptionRatio)
+    && stockRatio === 0 && subscriptionRatio === 0) {
+    errors.push("公司行動至少要有無償配股率或現增配股率其中一項大於 0");
+  }
+  // 單次無償配股率超過 1（每股配超過 1 股）極為罕見，多半是把「每仟股配股數」當成比率填進來。
+  if (Number.isFinite(stockRatio) && stockRatio > 1) errors.push("無償配股率大於 1，請確認不是每仟股配股數");
+  if (Number.isFinite(subscriptionRatio) && subscriptionRatio > 1) errors.push("現增配股率大於 1，請確認單位");
+  if (Number.isFinite(subscriptionRatio) && subscriptionRatio > 0
+    && (!Number.isFinite(subscriptionPrice) || subscriptionPrice <= 0)) {
+    errors.push("有現增配股率時必須提供大於 0 的認購價");
+  }
+  return errors;
+}
+
 function normalizeTradeSettings(input) {
   const src = input && typeof input === "object" ? input : {};
   const feeDiscount = Number(src.feeDiscount);
@@ -729,14 +838,6 @@ function effectiveTradeFee(raw, side, price, shares, settings, dividendStatus = 
   if (Number.isFinite(supplied) && supplied >= 0) return Math.round(supplied);
   if (side === "dividend") return dividendStatus === "received" ? 10 : null;
   return computeTradeFee(price, shares, settings);
-}
-
-function effectiveTradeTax(raw, side, kind, price, shares) {
-  if (side !== "sell") return 0;
-  const supplied = Number(raw?.tax);
-  return Number.isFinite(supplied) && supplied >= 0
-    ? Math.round(supplied)
-    : computeTradeTax(price, shares, kind);
 }
 
 function tradeEconomicFingerprint(raw, settings) {
@@ -874,8 +975,26 @@ function validateTradesMutationInput(input, todayCompact = toTaipeiCompactDate()
     const eventId = String(raw.eventId || "").trim();
     const dividendStatus = side === "dividend" ? effectiveDividendStatus(raw) : "";
 
-    if (!/^[0-9A-Z]{4,6}$/.test(code)) addError("code", "股票代號必須是 4～6 碼英數字", index);
-    if (!new Set(["buy", "sell", "dividend"]).has(side)) addError("side", "買賣類型只接受 buy、sell 或 dividend", index);
+    if (!SECURITY_CODE_PATTERN.test(code)) addError("code", "股票代號必須是 4～6 碼英數字", index);
+    if (!TRADE_SIDES.has(side)) addError("side", "買賣類型只接受 buy、sell、dividend 或 corporateAction", index);
+    // 公司行動（除權／現增）沒有成交價與股數，走獨立規則；其餘欄位驗證一律跳過，
+    // 避免為了遷就它而放寬買賣紀錄的既有防線。
+    if (side === TRADE_CORPORATE_ACTION_SIDE) {
+      if (!date || !isValidCompactCalendarDate(date)) addError("tradeDate", "除權基準日不是有效日期", index);
+      else if (date > today) addError("tradeDate", "除權基準日位於未來", index);
+      for (const message of corporateActionErrors(raw)) addError("corporateAction", message, index);
+      // 沿用買賣紀錄同一套「同 id 內容衝突」規則：同一筆公司行動重送要冪等，內容不同才是錯誤。
+      if (id) {
+        const fingerprint = stableJson({
+          side, code, date,
+          ...readCorporateActionRatios(raw),
+        });
+        const previous = idFingerprints.get(id);
+        if (previous && previous !== fingerprint) addError("id", `重複 id「${id}」的公司行動內容互相衝突`, index);
+        else idFingerprints.set(id, fingerprint);
+      }
+      continue;
+    }
     if (raw.kind != null && raw.kind !== "" && !new Set(["stock", "etf", "dayTrade"]).has(kind)) {
       addError("kind", "舊版商品類型只接受 stock、etf 或 dayTrade", index);
     }
@@ -1044,91 +1163,6 @@ function validateTradesMutationInput(input, todayCompact = toTaipeiCompactDate()
   return { ok: errors.length === 0, errors };
 }
 
-function normalizeTradesPayloadLegacy(input) {
-  const src = input && typeof input === "object" ? input : {};
-  const settings = normalizeTradeSettings(src.settings);
-  const seen = new Set();
-  const seenDividendEvents = new Set();
-  const records = [];
-  const list = Array.isArray(src.records) ? src.records : [];
-  const today = toTaipeiCompactDate();
-  for (const raw of list) {
-    if (!raw || typeof raw !== "object") continue;
-    const code = cleanCode(raw.code);
-    const side = ["buy", "sell", "dividend"].includes(raw.side) ? raw.side : "";
-    const kind = raw.kind == null || raw.kind === ""
-      ? "stock"
-      : ["stock", "etf", "dayTrade"].includes(raw.kind) ? raw.kind : "";
-    const price = Number(raw.price); // dividend 時 = 每股現金股利
-    const shares = Number(raw.shares);
-    const date = toCompactDate(raw.date);
-    if (
-      !/^[0-9A-Z]{4,6}$/.test(code)
-      || !side
-      || !kind
-      || !Number.isFinite(price)
-      || price <= 0
-      || !Number.isInteger(shares)
-      || shares <= 0
-      || !date
-      || !isValidCompactCalendarDate(date)
-      || date > today
-    ) continue;
-    const id = String(raw.id || `${code}-${date}-${records.length}`).slice(0, 48);
-    if (seen.has(id)) continue;
-    const eventId = side === "dividend" ? String(raw.eventId || "").trim().slice(0, 64) : "";
-    if (eventId && seenDividendEvents.has(eventId)) continue;
-    seen.add(id);
-    if (eventId) seenDividendEvents.add(eventId);
-    const dividendStatus = side === "dividend" ? effectiveDividendStatus(raw) : "";
-    const fee = effectiveTradeFee(raw, side, price, shares, settings, dividendStatus);
-    const tax = side === "sell"
-      ? (Number.isFinite(Number(raw.tax)) && Number(raw.tax) >= 0 ? Math.round(Number(raw.tax)) : computeTradeTax(price, shares, kind))
-      : 0;
-    const receivedDateRaw = raw.receivedDate ? toCompactDate(raw.receivedDate) : "";
-    const receivedDate = side === "dividend" && dividendStatus === "received"
-      ? (receivedDateRaw && isValidCompactCalendarDate(receivedDateRaw) && receivedDateRaw <= today ? receivedDateRaw : date)
-      : null;
-    const suppliedReceivedAmount = Number(raw.receivedAmount);
-    const receivedAmount = side === "dividend" && dividendStatus === "received"
-      ? (Number.isFinite(suppliedReceivedAmount) && suppliedReceivedAmount >= 0
-          ? Math.round(suppliedReceivedAmount * 100) / 100
-          : Math.max(0, Math.round((price * shares - (fee || 0)) * 100) / 100))
-      : null;
-    const normalizedRecord = {
-      id,
-      code,
-      side,
-      kind,
-      date,
-      // 股票成交價依台股申報檔位最多到小數第 2 位；現金股利公告則可能有更細的小數。
-      price: side === "dividend" ? Math.round(price * 1e6) / 1e6 : Math.round(price * 100) / 100,
-      shares,
-      fee,
-      tax,
-      note: String(raw.note || "").trim().slice(0, 60),
-      createdAt: String(raw.createdAt || "").slice(0, 40),
-    };
-    if (side === "dividend") {
-      normalizedRecord.status = dividendStatus;
-      normalizedRecord.receivedDate = receivedDate;
-      normalizedRecord.receivedAmount = receivedAmount;
-      normalizedRecord.entitledShares = shares;
-      if (eventId) {
-        normalizedRecord.eventId = eventId;
-        normalizedRecord.exDate = toCompactDate(raw.exDate) || date;
-        normalizedRecord.source = String(raw.source || "official-event").slice(0, 32);
-      } else if (raw.source) {
-        normalizedRecord.source = String(raw.source).slice(0, 32);
-      }
-    }
-    records.push(normalizedRecord);
-  }
-  // 依日期（同日依建立時間）排序，讓重放順序穩定。
-  records.sort((a, b) => a.date.localeCompare(b.date) || String(a.createdAt).localeCompare(String(b.createdAt)));
-  return { settings, records };
-}
-
 function readSuppliedTradeMoney(raw, canonicalField, legacyField, { allowNull = false } = {}) {
   for (const field of [canonicalField, legacyField]) {
     if (!Object.prototype.hasOwnProperty.call(raw, field)) continue;
@@ -1176,14 +1210,24 @@ function tradeRecordCoreErrors(raw, today) {
   const errors = [];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return ["紀錄不是物件"];
   const code = cleanCode(raw.code);
-  const side = ["buy", "sell", "dividend"].includes(raw.side) ? raw.side : "";
+  const side = TRADE_SIDES.has(raw.side) ? raw.side : "";
+  if (side === TRADE_CORPORATE_ACTION_SIDE) {
+    // 公司行動沒有成交價、股數與商品類型；共用 corporateActionErrors 避免與 validator 分岔。
+    const actionErrors = [];
+    if (!SECURITY_CODE_PATTERN.test(cleanCode(raw.code))) actionErrors.push("代號不是 4～6 碼英數字");
+    const actionDate = toCompactDate(raw.tradeDate || raw.date);
+    if (!actionDate || !isValidCompactCalendarDate(actionDate)) actionErrors.push("除權基準日不是有效日期");
+    else if (actionDate > today) actionErrors.push("除權基準日位於未來");
+    actionErrors.push(...corporateActionErrors(raw));
+    return actionErrors;
+  }
   const hasExplicitInstrument = raw.instrumentType != null && raw.instrumentType !== "";
   const legacyKind = raw.kind == null || raw.kind === "" ? "stock" : raw.kind;
   const instrumentType = normalizeTradeInstrumentType(raw);
   const price = Number(raw.price);
   const shares = Number(raw.shares);
   const date = toCompactDate(raw.tradeDate || raw.date);
-  if (!/^[0-9A-Z]{4,6}$/.test(code)) errors.push("代號不是 4～6 碼英數字");
+  if (!SECURITY_CODE_PATTERN.test(code)) errors.push("代號不是 4～6 碼英數字");
   if (!side) errors.push("買賣別無法辨識");
   if (hasExplicitInstrument && !TRADE_INSTRUMENT_TYPES.has(String(raw.instrumentType))) errors.push("商品類型無法辨識");
   if (!hasExplicitInstrument && !["stock", "etf", "dayTrade"].includes(legacyKind)) errors.push("舊商品類型無法辨識");
@@ -1198,6 +1242,25 @@ function tradeRecordCoreErrors(raw, today) {
 function normalizeTradeRecordV2(raw, { settings, today, index, payloadIsV2 }) {
   const code = cleanCode(raw.code);
   const side = raw.side;
+  if (side === TRADE_CORPORATE_ACTION_SIDE) {
+    // 公司行動是「事件」不是「成交」：沒有價金、沒有費稅、沒有商品分類與當沖。
+    // 只保留代號、基準日與三個比率；不塞 price/shares 假值，免得下游誤把它當成一筆買賣。
+    const ratios = readCorporateActionRatios(raw);
+    return {
+      id: String(raw.id || "").trim() || `ca-${code}-${toCompactDate(raw.tradeDate || raw.date)}`,
+      code,
+      side: TRADE_CORPORATE_ACTION_SIDE,
+      tradeDate: toCompactDate(raw.tradeDate || raw.date),
+      date: toCompactDate(raw.tradeDate || raw.date), // 舊 alias，排序與顯示共用
+      stockRatio: ratios.stockRatio,
+      subscriptionRatio: ratios.subscriptionRatio,
+      subscriptionPrice: ratios.subscriptionPrice,
+      source: TRADE_INSTRUMENT_SOURCES.has(raw.source) ? raw.source : "user",
+      note: String(raw.note || "").slice(0, 60),
+      createdAt: String(raw.createdAt || new Date().toISOString()),
+      __inputOrder: index,
+    };
+  }
   const priceValue = Number(raw.price);
   const price = side === "dividend"
     ? Math.round(priceValue * 1e6) / 1e6
@@ -1270,10 +1333,12 @@ function normalizeTradeRecordV2(raw, { settings, today, index, payloadIsV2 }) {
       ? raw.taxSource
       : legacyRecord ? "legacy" : "manual";
     taxRuleId = String(raw.taxRuleId || `${taxSource}-frozen`).slice(0, 80);
-  } else if (legacyRecord && raw.kind === "dayTrade") {
-    tax = computeTradeTax(price, shares, "dayTrade");
-    taxSource = "legacy";
-    taxRuleId = "legacy-daytrade-0.0015";
+  // 舊版 dayTrade 但沒帶 tax 的紀錄：這裡沒有任何金額可以「凍結」，是憑空產生一筆估算。
+  // 舊寫法直接呼叫沒有日期參數的 computeTradeTax(..., "dayTrade")，繞過 computeTradeTaxRule 的
+  // 有效日期判斷，讓 2017-04-28 減半上路前（以及 2027-12-31 之後）的成交日也享 1.5‰、稅短計一半，
+  // 還和同一筆的「未自動套用優惠稅率」warning 自相矛盾。改為落到下方 taxEstimate：
+  // legacyDeclared 的 matchedShares 已被 normalizeTradeDayTrade 歸零，自然回 tw-stock-general-0.003
+  // 並保有有效日期邊界；taxSource 仍維持 legacy。
   } else {
     tax = taxEstimate.amount;
     taxSource = legacyRecord ? "legacy" : "estimated";
@@ -1447,6 +1512,67 @@ function migrateTradesPayloadToV2(input, options = {}) {
 
 // 重放整份紀錄算持股與已實現損益。任何時點「賣出股數 > 當下庫存」→ ok:false（PUT 會被 400 擋下），
 // 這同時保護「刪掉舊買單導致後面的賣單變賣超」的情境。
+// D-22 補登入口：比對「官方公司行動歸檔」與「帳本已登錄的 corporateAction」，找出漏記的事件。
+// 為什麼需要這個：報價層的 quote.dividend 只帶最近一筆**未來**事件，除權日一過就滾出視窗，
+// 快速鈕因此只有一天的視窗期。漏記的後果不只是顯示假虧損，而是之後想賣掉含配股的股數會被
+// 賣超檢查擋下。所以改由伺服器用本機歸檔回溯比對，讓使用者事後也補得回來。
+// 只回報「使用者在該事件基準日之前確實持有」的檔位——沒持股就沒有配股可言。
+// 配股／現增的權利股數，一律按「除權基準日**之前**的持股」計算——基準日當天買進不享有權利，
+// 基準日當天賣出仍然享有（那天的價格已經是除權後的參考價）。
+//
+// 這個函式刻意做成兩個呼叫端共用：buildPortfolio 真正加股數的地方，與 findMissingCorporateActions
+// 提示「你漏登了 +N 股」的地方。以前後者對、前者用「重放到那一筆時的 pos.shares」，
+// 兩邊在同日交易上會給出不同答案：畫面承諾 +100 股、實際加 40 股，而且沒有任何徵兆。
+function sharesHeldBeforeExDate(records, code, exDate) {
+  let shares = 0;
+  for (const record of records) {
+    if (record.code !== code) continue;
+    const date = toCompactDate(record.tradeDate || record.date);
+    if (!date || date >= exDate) continue;
+    if (record.side === "buy") shares += Number(record.shares) || 0;
+    else if (record.side === "sell") shares -= Number(record.shares) || 0;
+    else if (record.side === TRADE_CORPORATE_ACTION_SIDE) {
+      shares += Math.floor(shares * (Number(record.stockRatio) || 0))
+        + Math.floor(shares * (Number(record.subscriptionRatio) || 0));
+    }
+  }
+  return shares;
+}
+
+async function findMissingCorporateActions(payload) {
+  const records = Array.isArray(payload?.records) ? payload.records : [];
+  if (!records.length) return [];
+  await loadFundamentalsHistory();
+  const logged = new Set(records
+    .filter((record) => record.side === TRADE_CORPORATE_ACTION_SIDE)
+    .map((record) => `${record.code}|${toCompactDate(record.tradeDate || record.date)}`));
+  const sharesBefore = (code, exDate) => sharesHeldBeforeExDate(records, code, exDate);
+  const missing = [];
+  for (const code of new Set(records.map((record) => record.code))) {
+    for (const action of corporateActionHistoryForCode(code)) {
+      const exDate = toCompactDate(action.exDate);
+      if (!exDate || logged.has(`${code}|${exDate}`)) continue;
+      const stockRatio = Number(action.stockRatio) || 0;
+      const subscriptionRatio = Number(action.subscriptionRatio) || 0;
+      // 純現金股利不影響股數，不在這裡回報（它走既有的股利流程）。
+      if (stockRatio <= 0 && subscriptionRatio <= 0) continue;
+      const shares = sharesBefore(code, exDate);
+      if (shares <= 0) continue;
+      missing.push({
+        code,
+        exDate,
+        stockRatio,
+        subscriptionRatio,
+        subscriptionPrice: Number(action.subscriptionPrice) || 0,
+        sharesBefore: shares,
+        bonusShares: Math.floor(shares * stockRatio),
+        subscribedShares: Math.floor(shares * subscriptionRatio),
+      });
+    }
+  }
+  return missing.sort((a, b) => a.exDate.localeCompare(b.exDate)).slice(0, 20);
+}
+
 function buildPortfolio(payload) {
   const records = Array.isArray(payload?.records) ? payload.records : [];
   const positions = new Map(); // code → { shares, cost }
@@ -1454,6 +1580,30 @@ function buildPortfolio(payload) {
   const realized = [];
   for (const t of records) {
     const pos = positions.get(t.code) || { shares: 0, cost: 0 };
+    if (t.side === TRADE_CORPORATE_ACTION_SIDE) {
+      // 會計上：無償配股＝以 0 元取得股票，現增＝以認購價取得股票。兩者都只是「加股數、加成本」，
+      // 均價自然稀釋，所以這裡不需要任何特殊公式。除息不走這裡（現金股利不動持股與成本）。
+      // 權利股數要按「除權基準日**之前**的持股」算，不能用重放到這一筆時的 pos.shares。
+      // 兩者在同日交易上會分岔，而且一定會分岔：compareTradeChronology 在缺 executedAt 時
+      // 退回 createdAt 排序，而補登配股的快速鈕填的是「按下去的當下」——必然排在同日買賣之後。
+      //   6/1 買 1000、7/10 再買 1000、7/10 除權 0.1 → 正確 +100 股，舊寫法給 +200
+      //   6/1 買 1000、7/10 賣 600、7/10 除權 0.1   → 正確 +100 股，舊寫法給 +40
+      //   6/1 買 2000、7/10 全賣、7/10 除權 0.5     → 正確 +1000 股，舊寫法 pos.shares 是 0
+      //                                                → 整批蒸發，之後想賣還會被賣超檢查擋下
+      // 基準日當天賣出仍然享有權利（那天的價格已經是除權後的參考價），所以守衛也要看
+      // sharesBefore 而不是 pos.shares——否則「當天賣光」這個情境會被整個跳過。
+      const entitledShares = sharesHeldBeforeExDate(records, t.code, toCompactDate(t.tradeDate || t.date));
+      if (entitledShares > 0) {
+        // 不足一股的部分不會給零股而是折現金發放；帳本只追蹤股數，所以無條件捨去，
+        // 寧可少算不要多算。
+        const bonusShares = Math.floor(entitledShares * (Number(t.stockRatio) || 0));
+        const subscribedShares = Math.floor(entitledShares * (Number(t.subscriptionRatio) || 0));
+        pos.shares += bonusShares + subscribedShares;
+        pos.cost += subscribedShares * (Number(t.subscriptionPrice) || 0);
+        positions.set(t.code, pos);
+      }
+      continue;
+    }
     if (t.side === "dividend") {
       // 除息日先認列應收，實際匯入後才進 receivedNet；兩者都不動持股與成本。
       const dividend = dividendsByCode.get(t.code) || { recognizedGross: 0, receivableGross: 0, receivedNet: 0 };
@@ -1477,7 +1627,14 @@ function buildPortfolio(payload) {
       if (t.shares > pos.shares) {
         return {
           ok: false,
-          error: `${t.date.slice(4, 6)}/${t.date.slice(6, 8)} 賣出 ${t.code} ${t.shares} 股，但當時庫存只有 ${pos.shares} 股（賣超）。請檢查買賣紀錄的日期與股數。`,
+          // D-31：同日多筆買賣的先後，只在**每一筆都填了成交時間**時才靠 executedAt 判斷；
+          // 任一筆缺值就整組退回「記帳時刻／輸入順序」。使用者照對帳單謄寫時常常先記賣出、
+          // 後記買進，順序就反了，於是明明合法的紀錄被判成賣超、整包 PUT 被 400 擋下。
+          // 補填成交時間就能解，但以前完全沒告訴使用者——這裡把自救路徑直接寫進錯誤訊息。
+          error: `${t.date.slice(4, 6)}/${t.date.slice(6, 8)} 賣出 ${t.code} ${t.shares} 股，但當時庫存只有 ${pos.shares} 股（賣超）。`
+            + "請檢查買賣紀錄的日期與股數；若同一天有多筆買賣，請在每一筆補填「成交時間」，"
+            + "否則系統只能依記帳先後排序，可能把當天較晚的買進排在賣出之後。"
+            + "另外，若這檔曾經除權配股或現增，也要補登公司行動，否則股數會停在配股前。",
         };
       }
       const avgCost = pos.cost / pos.shares;
@@ -1806,12 +1963,7 @@ async function recoverDbFromBackup(parseError) {
   } catch {
     // 改名失敗就原地留著，仍嘗試備份
   }
-  let backups = [];
-  try {
-    backups = (await readdir(dbBackupDir)).filter((name) => /^stock1-db-\d{8}\.json$/.test(name)).sort();
-  } catch {
-    backups = [];
-  }
+  const backups = await listDbBackupNames();
   while (backups.length) {
     const name = backups.pop(); // 從最新的備份開始試
     try {
@@ -1832,9 +1984,42 @@ async function recoverDbFromBackup(parseError) {
   return createEmptyDb();
 }
 
+// 依日期排序的每日備份檔名（新的在後）。恢復路徑與「主檔不見了」的偵測共用同一份判準。
+async function listDbBackupNames() {
+  try {
+    return (await readdir(dbBackupDir)).filter((name) => /^stock1-db-\d{8}\.json$/.test(name)).sort();
+  } catch {
+    return [];
+  }
+}
+
 async function loadDbOnce() {
   await mkdir(dataDir, { recursive: true });
   let recoveredFromCorruption = false;
+  // 主檔不存在但**備份存在** ＝ 這不是第一次啟動，是主檔不見了。
+  // 舊行為是直接起一個空 DB 並在下面立刻 saveDb 落盤，畫面上唯一的線索是
+  // 「Created initial admin user "admin"」——讀起來就像第一次開機。
+  // 而隔天 backupDbDaily 會把這個空 DB 複製成當天的還原點，14 天後好備份全部被輪替掉，
+  // 交易帳本、自選股、共享備註全部永久消失。
+  //
+  // 觸發路徑不罕見：防毒隔離、OneDrive 衝突改名、使用者看到 corrupt 訊息後手動刪檔，
+  // 或 corrupt → rename → saveDb 失敗 → 重跑。
+  //
+  // **刻意 fail-closed 而不是自動還原**：要用哪一份備份、備份日之後的變更怎麼辦，
+  // 都是使用者才能決定的事；自動挑一份等於替他做了一個他不知情的選擇。
+  // 沒有備份時才是真正的第一次啟動，照舊起空 DB。
+  if (!existsSync(dbPath)) {
+    const backups = await listDbBackupNames();
+    if (backups.length) {
+      throw new Error(
+        `主資料庫 ${dbPath} 不存在，但 ${dbBackupDir} 裡有 ${backups.length} 份備份`
+        + `（最新：${backups.at(-1)}）。這代表主檔遺失而不是第一次啟動，`
+        + "為避免以空資料庫覆蓋掉備份，伺服器不會啟動。\n"
+        + `  要還原：把 ${join(dbBackupDir, backups.at(-1))} 複製成 ${dbPath} 再啟動。\n`
+        + `  確定要全新開始：先把 ${dbBackupDir} 移到別處（不要直接刪，那是你唯一的資料）。`,
+      );
+    }
+  }
   if (existsSync(dbPath)) {
     // 讀檔 I/O 錯誤（EACCES/EIO/EBUSY/EISDIR…）不是 JSON 損壞：必須原錯誤 fail-closed，
     // 絕不能把檔案／目錄改名後再靜默回退備份或空 DB。
@@ -2685,7 +2870,7 @@ function parseRequestedCodes(value, fallback = defaultCodes, maxCodes = MAX_REQU
     throw new Error(`股票代號一次最多 ${maxCodes} 檔`);
   }
   const normalized = raw.map((item) => String(item || "").trim().toUpperCase());
-  if (normalized.some((code) => !/^[0-9A-Z]{4,6}$/.test(code))) {
+  if (normalized.some((code) => !SECURITY_CODE_PATTERN.test(code))) {
     throw new Error("股票代號格式不正確（限 4–6 碼英數字）");
   }
   const codes = [...new Set(normalized)];
@@ -2844,6 +3029,37 @@ function isOrdinaryStock(quote) {
   return !excluded.some((token) => name.includes(token));
 }
 
+// 整批收盤檔在除權息日把「漲跌」欄設成 "0.0000"——那是一個**可以正常解析的零**，不是遮罩。
+// 於是 previousClose 被算成「今天的收盤」、漲跌變成 0.00%，看起來就像一個正常的平盤日。
+// 2026-07-27 實測 07/24 除息的六檔：畫面全部顯示 0.00%／中性灰，實際相對官方參考價
+// 是 +1.06%（中鋼）到 -2.68%（榮星）。台股慣例是除權息日的漲跌以**除權息參考價**為基準
+// （交易所與券商都這樣報），所以 0.00% 不只是不精確，是錯的。
+// 連帶影響：preselectQuotes 的 momentumValue = |changePct| × log10(量) 變成 0 → 排序墊底
+// → 除權息當天的股票實質上進不了隔日沖候選池。
+//
+// 這與專案早就記錄過的「MIS 的 0.0000 是無成交哨兵」是同一類陷阱，只是沒人檢查過這個欄位。
+//
+// **一定要靠官方事件表判斷，不能看到 0 就當事件**：真正的平盤日同樣回 "0.0000"。
+// 查不到官方參考價時維持原值（並由掃描端的降級揭露負責告知）。
+function applyCorporateActionQuoteBaseline(quote) {
+  if (!quote || quote.change !== 0) return quote;
+  const price = Number(quote.price);
+  if (!Number.isFinite(price) || price <= 0) return quote;
+  const item = corporateActionResultFor(quote.code, quote.rawDate || quote.asOf);
+  if (!item) return quote;
+  const previousClose = item.referencePrice;
+  if (!Number.isFinite(previousClose) || previousClose <= 0) return quote;
+  const change = price - previousClose;
+  return {
+    ...quote,
+    previousClose,
+    change,
+    changePct: (change / previousClose) * 100,
+    // 讓下游（UI／揭露）知道這個漲跌是相對除權息參考價算的，不是相對前一日收盤。
+    corporateActionBaseline: true,
+  };
+}
+
 function normalizeDailyTwse(row) {
   const close = parsePositivePrice(row.ClosingPrice);
   const change = parseNumber(row.Change);
@@ -2865,6 +3081,9 @@ function normalizeDailyTwse(row) {
     changePct: close !== null && previousClose ? (change / previousClose) * 100 : null,
     unitLots: null,
     volumeLots: Math.round((parseNumber(row.TradeVolume) || 0) / 1000),
+    // 官方整批收盤本來就有成交金額，只是以前沒解析 → 補當日 K 時 tradeValue 恆為 null，
+    // 導致每一檔（含成交數百億的權值股）都被 buildRiskTags 標成「低流動性」。
+    tradeValue: parseNumber(row.TradeValue),
     transactions: parseNumber(row.Transaction),
     rawDate: row.Date,
   };
@@ -2891,6 +3110,7 @@ function normalizeDailyTpex(row) {
     changePct: close !== null && previousClose ? (change / previousClose) * 100 : null,
     unitLots: null,
     volumeLots: Math.round((parseNumber(row.TradingShares) || 0) / 1000),
+    tradeValue: parseNumber(row.TransactionAmount), // 同上：上櫃側的成交金額欄位
     transactions: parseNumber(row.TransactionNumber),
     rawDate: row.Date,
   };
@@ -3342,9 +3562,11 @@ function parseCompanyDirectorySnapshot(marketKey, rows, previous) {
   };
 }
 
-async function loadCompanyDirectoryMarket(marketKey) {
-  const state = companyDirectoryMarketCache[marketKey];
-  const source = COMPANY_DIRECTORY_SOURCES[marketKey];
+// 官方主檔類載入器共用的「TTL 新鮮 → single-flight → 退避期內回 last-good → 失敗保留舊值」骨架。
+// 原本 reference／公司主檔／商品主檔／交易日曆四支各自抄了一份同樣的 25 行；抄漏一行
+// （例如忘了在 finally 清 inFlight）就會把永不 resolve 的 promise 存進快取，整個面板卡死。
+// state 沿用 { value, expiresAt, retryAt, lastError, inFlight } 形狀；load(previousValue) 回新值或 throw。
+async function loadWithLastGood(state, { ttlMs, retryMs, load }) {
   const now = Date.now();
   if (state.value && state.expiresAt > now) return { status: "fresh", value: state.value, error: "" };
   if (state.inFlight) return state.inFlight;
@@ -3353,22 +3575,30 @@ async function loadCompanyDirectoryMarket(marketKey) {
   }
   state.inFlight = (async () => {
     try {
-      const rows = await fetchJson(source.url);
-      const value = parseCompanyDirectorySnapshot(marketKey, rows, state.value);
+      const value = await load(state.value);
       state.value = value;
-      state.expiresAt = Date.now() + COMPANY_DIRECTORY_TTL_MS;
+      state.expiresAt = Date.now() + ttlMs;
       state.retryAt = 0;
       state.lastError = "";
       return { status: "fresh", value, error: "" };
     } catch (error) {
       state.lastError = String(error?.message || error || "未知錯誤");
-      state.retryAt = Date.now() + COMPANY_DIRECTORY_RETRY_MS;
+      state.retryAt = Date.now() + retryMs;
       return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
     }
   })().finally(() => {
     state.inFlight = null;
   });
   return state.inFlight;
+}
+
+async function loadCompanyDirectoryMarket(marketKey) {
+  const source = COMPANY_DIRECTORY_SOURCES[marketKey];
+  return loadWithLastGood(companyDirectoryMarketCache[marketKey], {
+    ttlMs: COMPANY_DIRECTORY_TTL_MS,
+    retryMs: COMPANY_DIRECTORY_RETRY_MS,
+    load: async (previous) => parseCompanyDirectorySnapshot(marketKey, await fetchJson(source.url), previous),
+  });
 }
 
 // 公司主檔只抓一次，同時產生「發行股數」與「產業／簡稱」兩種視圖；
@@ -3489,7 +3719,7 @@ function parseTwseEtfDirectorySnapshot(rows, previous = null) {
       if (typeof row[field] !== "string" || !row[field].trim()) throw new Error(`上市 ETF 官方主檔缺少必要欄位：${field}`);
     }
     const rawCode = String(row["基金代號"] || "").trim().toUpperCase();
-    if (!/^[0-9A-Z]{4,6}$/.test(rawCode)) throw new Error(`上市 ETF 官方主檔含無效代號：${rawCode || "空白"}`);
+    if (!SECURITY_CODE_PATTERN.test(rawCode)) throw new Error(`上市 ETF 官方主檔含無效代號：${rawCode || "空白"}`);
     const asOf = toCompactDate(row["出表日期"]);
     const listingDate = toCompactDate(row["上市日期"]);
     const inceptionDate = toCompactDate(row["成立日期"]);
@@ -3551,7 +3781,7 @@ function parseTpexEtfCategory(category, payload) {
   for (const row of data) {
     if (!Array.isArray(row)) continue;
     const code = String(row[0] || "").trim().toUpperCase();
-    if (!/^[0-9A-Z]{4,6}$/.test(code)) continue;
+    if (!SECURITY_CODE_PATTERN.test(code)) continue;
     if (seenCodes.has(code)) throw new Error(`上櫃 ETF ${category} 代號重複：${code}`);
     seenCodes.add(code);
     const listingDate = toCompactDate(row[2]);
@@ -3622,32 +3852,13 @@ async function fetchTpexEtfDirectoryPayloads() {
 }
 
 async function loadProductDirectoryMarket(marketKey) {
-  const state = productDirectoryMarketCache[marketKey];
-  const now = Date.now();
-  if (state.value && state.expiresAt > now) return { status: "fresh", value: state.value, error: "" };
-  if (state.inFlight) return state.inFlight;
-  if (state.retryAt > now) {
-    return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-  }
-  state.inFlight = (async () => {
-    try {
-      const value = marketKey === "twse"
-        ? parseTwseEtfDirectorySnapshot(await fetchJson(TWSE_ETF_DIRECTORY_URL), state.value)
-        : parseTpexEtfDirectorySnapshot(await fetchTpexEtfDirectoryPayloads(), state.value);
-      state.value = value;
-      state.expiresAt = Date.now() + PRODUCT_DIRECTORY_TTL_MS;
-      state.retryAt = 0;
-      state.lastError = "";
-      return { status: "fresh", value, error: "" };
-    } catch (error) {
-      state.lastError = String(error?.message || error || "未知錯誤");
-      state.retryAt = Date.now() + PRODUCT_DIRECTORY_RETRY_MS;
-      return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-    }
-  })().finally(() => {
-    state.inFlight = null;
+  return loadWithLastGood(productDirectoryMarketCache[marketKey], {
+    ttlMs: PRODUCT_DIRECTORY_TTL_MS,
+    retryMs: PRODUCT_DIRECTORY_RETRY_MS,
+    load: async (previous) => (marketKey === "twse"
+      ? parseTwseEtfDirectorySnapshot(await fetchJson(TWSE_ETF_DIRECTORY_URL), previous)
+      : parseTpexEtfDirectorySnapshot(await fetchTpexEtfDirectoryPayloads(), previous)),
   });
-  return state.inFlight;
 }
 
 async function getProductDirectory() {
@@ -3747,7 +3958,7 @@ function officialProfileForEtn(code, reference) {
 async function resolveOfficialInstruments(codes) {
   const requested = unique((Array.isArray(codes) ? codes : [codes])
     .map((code) => cleanCode(code))
-    .filter((code) => /^[0-9A-Z]{4,6}$/.test(code)));
+    .filter((code) => SECURITY_CODE_PATTERN.test(code)));
   const [productResult, companyResult, referenceResult] = await Promise.allSettled([
     getProductDirectory(),
     getCompanyDirectory(),
@@ -3978,7 +4189,23 @@ function canonicalizeTradeMoneyProvenance(input, existingPayload) {
   };
 
   for (const record of records) {
-    if (!record || typeof record !== "object" || Array.isArray(record) || record.side === "dividend") continue;
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    if (record.side === "dividend") {
+      // 股利只有匯費、沒有證交稅，而且前端固定送 `fee: null`＝「未知，交給後端決定」——
+      // normalizeTradeRecordV2 用 allowNull 特別尊重那個 null，把它 canonicalize 掉會讓
+      // 已入帳股利的匯費從 null 變成預設 10，直接改到 dividendReceivedNet。
+      // 所以這裡只堵真正的破口：client 宣稱 estimated／legacy（規格上由伺服器管理的來源）
+      // 卻自帶金額，那是偽造，必須清掉並交回後端重算。現行前端從不帶 feeSource，
+      // 因此這條規則對既有資料是 no-op。
+      const claimedSource = String(record.feeSource || "");
+      if (claimedSource === "estimated" || claimedSource === "legacy") {
+        delete record.feeAmountTwd;
+        delete record.fee;
+        delete record.feeSource;
+        delete record.feeRuleId;
+      }
+      continue;
+    }
     const existing = existingById.get(String(record.id || ""));
     const sameEconomics = Boolean(existing)
       && tradeMoneyEstimateFingerprint(existing) === tradeMoneyEstimateFingerprint(record);
@@ -4021,6 +4248,10 @@ function loadFundamentalsHistory() {
     fundamentalsHistory.eps ||= {};
     fundamentalsHistory.valuation ||= {};
     fundamentalsHistory.dividends ||= {};
+    // 官方除權除息計算結果表（TWT49U）的歸檔：與「預告」分開存，
+    // 免得事後結果的欄位被預告表的 withdrawn／formulaComplete 邏輯掃到。
+    fundamentalsHistory.corporateActionResults ||= {};
+    fundamentalsHistory.corporateActionResultMonths ||= {};
     return fundamentalsHistory;
   })();
   return fundamentalsHistoryPromise;
@@ -4172,8 +4403,8 @@ const DIVIDEND_SOURCES = {
   TPEx: { url: "https://www.tpex.org.tw/openapi/v1/tpex_exright_prepost", label: "上櫃" },
 };
 const dividendMarketCache = {
-  TWSE: { value: null, expiresAt: 0, inFlight: null, lastError: "" },
-  TPEx: { value: null, expiresAt: 0, inFlight: null, lastError: "" },
+  TWSE: { value: null, expiresAt: 0, inFlight: null, lastError: "", shapeWarnings: [] },
+  TPEx: { value: null, expiresAt: 0, inFlight: null, lastError: "", shapeWarnings: [] },
 };
 
 function normalizeDividendKind(value) {
@@ -4184,10 +4415,35 @@ function normalizeDividendKind(value) {
   return text ? `除${text}` : "";
 }
 
-function normalizeDividendMarketRows(source, rows, today = toTaipeiCompactDate()) {
+// 單次無償配股率／現增比率大於 1（＝配股超過 100%）本來就極罕見。真正要防的不是罕見事件，
+// 是**上游把單位從「比率」改成「每仟股股數」**：欄位名叫 Ratio，但同一份報表的網頁版是以
+// 「每仟股無償配股（股）」呈現，兩者差 100 倍。若上游改版，referencePrice 的除數會從 1.1 變成 101，
+// 整段 K 線塌陷，而且 formulaComplete 仍是 true、source 仍蓋著 official 章——不會有任何告警。
+//
+// 下游（plausibleShareFactor / officialCorporateActionRatio）已經會把 >1 當成「推導不出來」而
+// 走未定案，所以災難分支已經擋住了。這裡補的是**告警**：讓它在資料進來的當下就喊出來，
+// 而不是等使用者發現整條均線塌了才去讀 JSON。
+//
+// 2026-07-27 實測（TWSE 125 筆＋TPEx 138 筆預告）：29 筆真實配股全部落在 (0, 1)，最大 0.5；
+// 並用官方計算結果表反推驗證 7 個案例，比率單位算出的參考價與交易所公布值誤差都 ≤ 0.01
+// （7740 熙特爾：(157−2.05)/1.12782 = 137.39，官方 137.38）。單位確認是比率。
+const DIVIDEND_RATIO_MAX_PLAUSIBLE = 1;
+// 每檔除權息事件的歸檔上限。與官方計算結果表（corporateActionResults）的 40 對齊——
+// 月配息 ETF 兩年就累積 24 筆，舊的 12 筆會把還原需要的資料吃掉。
+const DIVIDEND_HISTORY_MAX_EVENTS_PER_CODE = 40;
+function implausibleDividendRatioLabel(item) {
+  const stockRatio = Number(item?.stockRatio);
+  const subscriptionRatio = Number(item?.subscriptionRatio);
+  if (Number.isFinite(stockRatio) && stockRatio > DIVIDEND_RATIO_MAX_PLAUSIBLE) return `無償配股率 ${stockRatio}`;
+  if (Number.isFinite(subscriptionRatio) && subscriptionRatio > DIVIDEND_RATIO_MAX_PLAUSIBLE) return `現增比率 ${subscriptionRatio}`;
+  return "";
+}
+
+function normalizeDividendMarketRows(source, rows, today = toTaipeiCompactDate(), warnings = []) {
   if (!Array.isArray(rows) || !rows.length) throw new Error(`${DIVIDEND_SOURCES[source].label}除權息來源回傳空資料`);
   const archiveMap = new Map();
   const futureMap = new Map();
+  const implausible = [];
   for (const row of rows) {
     const code = cleanCode(source === "TWSE" ? row.Code : row.SecuritiesCompanyCode);
     if (!/^\d{4}$/.test(code)) continue;
@@ -4209,6 +4465,8 @@ function normalizeDividendMarketRows(source, rows, today = toTaipeiCompactDate()
       source,
     };
     if (!item.exDate) continue;
+    const implausibleLabel = implausibleDividendRatioLabel(item);
+    if (implausibleLabel && implausible.length < 5) implausible.push(`${code} ${item.exDate} 的${implausibleLabel}`);
     const archiveList = archiveMap.get(code) || [];
     archiveList.push(item);
     archiveMap.set(code, archiveList);
@@ -4219,6 +4477,38 @@ function normalizeDividendMarketRows(source, rows, today = toTaipeiCompactDate()
     }
   }
   if (!archiveMap.size) throw new Error(`${DIVIDEND_SOURCES[source].label}除權息來源沒有有效股票代號`);
+  // 同一代號同一除權息日的多列。appendDividendHistoryNow 寫的是 slot[exDate]，**後者覆蓋前者**，
+  // 所以多列會靜默丟掉一半——若上游哪天把除權息拆成「除權一列＋除息一列」，
+  // 參考價就只用半個事件算出來，而且蓋著 official 章、沒有任何告警。
+  //
+  // 2026-07-27 實測：TWSE 125 列＋TPEx 138 列，**(代號, 除權息日) 全部唯一、0 組重複**。
+  // 也就是說這是防禦性偵測，不是已觀察到的錯誤——歸檔裡 revision ≥3 的 7 筆（最高 4）
+  // 有更簡單的解釋：7 筆裡 5 筆是除權／除權息，配股條件本來就會分次定案。
+  // 刻意**不合併**：合併公式要先確認上游真的怎麼拆，猜錯比不算更糟。
+  const duplicates = [];
+  for (const [code, list] of archiveMap) {
+    const byDate = new Map();
+    for (const item of list) byDate.set(item.exDate, (byDate.get(item.exDate) || 0) + 1);
+    for (const [exDate, count] of byDate) {
+      if (count <= 1) continue;
+      for (const item of list) if (item.exDate === exDate) item.duplicateRows = true;
+      if (duplicates.length < 5) duplicates.push(`${code} ${exDate}（${count} 列）`);
+    }
+  }
+  if (duplicates.length) {
+    warnings.push(
+      `${DIVIDEND_SOURCES[source].label}除權息有同一代號同一天多列的情形（${duplicates.join("、")}）`
+      + "，資料結構無法表達同日多事件；這些事件已標為未定案，不會用半個事件算出參考價。",
+    );
+  }
+  // 不 throw：真的出現合法的 >100% 配股時，把整個市場的除權息資料丟掉會比算錯更糟。
+  // 記 warning 讓它浮到畫面上，實際的比率仍由下游判成未定案。
+  if (implausible.length) {
+    warnings.push(
+      `${DIVIDEND_SOURCES[source].label}除權息的配股／現增比率超過 100%（${implausible.join("、")}）`
+      + "，可能是上游把單位從比率改成每仟股股數；這些事件的還原會標為未定案，請查官方原文。",
+    );
+  }
   for (const map of [archiveMap, futureMap]) {
     for (const list of map.values()) list.sort((a, b) => a.exDate.localeCompare(b.exDate));
   }
@@ -4234,7 +4524,11 @@ async function loadDividendMarket(source) {
     try {
       const rows = await fetchJsonWithRetry(DIVIDEND_SOURCES[source].url, { headers: openapiHeaders });
       const today = toTaipeiCompactDate();
-      const normalized = normalizeDividendMarketRows(source, rows, today);
+      // 比率量級異常要浮到畫面上，不能只在下游默默判成未定案（見 implausibleDividendRatioLabel）。
+      const shapeWarnings = [];
+      const normalized = normalizeDividendMarketRows(source, rows, today, shapeWarnings);
+      for (const warning of shapeWarnings) console.warn(`[Stock1] ${warning}`);
+      state.shapeWarnings = shapeWarnings;
       // 成功 HTTP 不等於完整資料：若尚未到期的公告總數突然少掉四成以上，先視為上游半包。
       // 分母只算「以本次台北今日仍屬未來」的 last-good，已過除權息日的自然縮減不應被誤擋。
       const countUpcoming = (map) => [...(map?.values?.() || [])].reduce(
@@ -4272,6 +4566,12 @@ async function getDividendSchedule() {
     }
   }
   combined.sourceStatus = { TWSE: twse.status, TPEx: tpex.status };
+  // 比率量級異常（疑似上游把單位從比率改成每仟股股數）要跟著資料一起往上傳，
+  // 否則它只會留在伺服器 console 裡，使用者看不到自己的均線為什麼塌了。
+  combined.shapeWarnings = [
+    ...(dividendMarketCache.TWSE.shapeWarnings || []),
+    ...(dividendMarketCache.TPEx.shapeWarnings || []),
+  ];
   const degraded = twse.status !== "fresh" || tpex.status !== "fresh";
   fundamentalsSourceCache.set("dividends", {
     expiresAt: Date.now() + (degraded ? DIVIDEND_SCHEDULE_DEGRADED_TTL_MS : DIVIDEND_SCHEDULE_TTL_MS),
@@ -4316,7 +4616,13 @@ async function appendDividendHistoryNow(map, { successfulSources = [] } = {}) {
       const hasSubscriptionRatio = hasFiniteField(item.subscriptionRatio);
       const subscriptionRatio = item.subscriptionRatio == null ? 0 : Number(item.subscriptionRatio);
       const formulaComplete = (
-        (!kind.includes("息") || hasFiniteField(item.cashDividend))
+        // 同一代號同一除權息日出現多列時，下面的 slot[item.exDate] 是**後者覆蓋前者**，
+        // 會靜默丟掉另外那一半（例如上游把除權息拆成「除權一列＋除息一列」），
+        // 於是參考價只用半個事件算出來，卻蓋著 formulaComplete=true 與 official 章。
+        // 目前實測 0 次（見 normalizeDividendMarketRows），但真的發生時是無聲的錯答案，
+        // 所以一律當成算不出來——unresolved 優於算錯。合併公式等確認上游真的拆列再做。
+        !item.duplicateRows
+        && (!kind.includes("息") || hasFiniteField(item.cashDividend))
         && (!kind.includes("權") || hasFiniteField(item.stockRatio) || hasSubscriptionRatio)
         && Number.isFinite(subscriptionRatio)
         && subscriptionRatio >= 0
@@ -4346,7 +4652,17 @@ async function appendDividendHistoryNow(map, { successfulSources = [] } = {}) {
       }
     }
     const keys = Object.keys(slot).sort();
-    while (keys.length > 12) {
+    // 每檔保留幾筆事件。40 是與官方計算結果表（corporateActionResults，下方同名上限）
+    // 對齊的數字，理由在那裡寫過：月配息 ETF 兩年就累積 24 筆，12 筆會把還原需要的資料吃掉。
+    //
+    // 這一份比結果表更不能省：**TWT48U_ALL 是滾動未來窗，除息日一過就查不到**
+    // （見 DIVIDEND_SOURCES 的註解），被淘汰掉就是永久消失、沒有任何端點補得回來；
+    // 而 TWT49U 只涵蓋上市，**上櫃的月配 ETF 只有這一份歸檔**。
+    // 消費端（corporateActionHistoryForCode）要的窗是 13 個月到 5 年，12 筆遠遠不夠。
+    //
+    // 失效時完全沒有徵兆：corporateActionHistoryForCode 對「被淘汰掉」與「那天本來就沒事件」
+    // 都回空陣列，unresolved 不會亮，補登提示（findMissingCorporateActions）也一起失效。
+    while (keys.length > DIVIDEND_HISTORY_MAX_EVENTS_PER_CODE) {
       delete slot[keys.shift()];
       dirty = true;
     }
@@ -4456,6 +4772,225 @@ function corporateActionHistoryForCode(code, fromDate = "", throughDate = "") {
     .map((exDate) => ({ exDate, ...slot[exDate] }));
 }
 
+// === 官方除權除息「計算結果表」（TWSE TWT49U）===
+//
+// 這是事後結果表，不是事前預告表，兩者的價值完全不同：
+//   TWT48U_ALL（預告）：只有未來滾動窗，除息日一過就查不到，而且欄位會用 null 表達
+//                      「沒有這件事」，得自己套公式還原參考價。
+//   TWT49U（結果）  ：可依任意歷史日期區間查詢，直接給「除權息前收盤價」與「除權息參考價」。
+//                      兩者相除就是精確的還原因子，不必套公式、不受欄位留空影響，
+//                      而且是交易所自己套過升降單位的數字。ETF 的配息也涵蓋在內。
+//
+// 2026-07-26 實測（真實 API）：
+//   - 任意歷史區間都查得到（試到 2024-03 仍有資料），單次六個月回 598 列。
+//   - 逐月抓最穩，而且一次請求就涵蓋全市場所有代號，掃描 240 檔候選也只要同樣的月份數。
+//   - 這條來源之所以重要：本機預告歸檔只從部署後才累積，實測連台積電（2026-06-11）、
+//     鴻海（07-02）、中華電（07-09）的除息日都沒抓到，而它們的跳空（-0.22%／-3.63%／-4.30%）
+//     全部遠低於 10.5% heuristic 門檻 → 目前這些股票的均線完全沒有還原。
+const CORPORATE_ACTION_RESULT_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U";
+const CORPORATE_ACTION_RESULT_CURRENT_TTL_MS = 6 * 3600e3;
+const CORPORATE_ACTION_RESULT_MAX_MONTHS = 30; // 技術頁最長抓 24 個月，留一點餘裕
+// 補齊範圍必須涵蓋「歷史真正可能退到多遠」，不是「正常情況抓幾個月」。
+// 掃描、隔日沖、驗證推進三個入口都開了 allowExternalFallback + fallbackRange "1y"：
+// 官方逐檔歷史被限流時整包會退成 Yahoo 的一年序列。只補 5~8 個月的話，第 9~13 個月的
+// 除權息在同步的 corporateActionResultFor() 查不到、Yahoo 列又沒有 X 標記與交易所昨收、
+// 跳空多半也低於 10.5% → **完全不還原**；而且那幾個月根本沒被請求過，degraded 仍是 false，
+// 揭露機制會在最常見的降級情境下回報「一切正常」。
+const CORPORATE_ACTION_RESULT_FALLBACK_MONTHS = 13; // Yahoo 備援上限 1y ＋ 1 個月邊界餘裕
+const CORPORATE_ACTION_RESULT_RETRY_MS = 5 * 60e3;
+// 併發只壓到 2。冷啟動總共也才 8~24 個請求、抓完就落盤永久有效，快個兩秒毫無意義；
+// 但證交所會限流，實測併發 6 在掃描流程裡會整批失敗（8 個月全掛），
+// 而失敗的代價是那些月份的除權息全部還原不到。穩定遠比快重要。
+const CORPORATE_ACTION_RESULT_CONCURRENCY = 2;
+const corporateActionResultInFlight = new Map();
+// 失敗的月份短期內不再重試：冷啟動要補 24 個月，上游掛掉時若每次開頁都重打
+// 就會變成「一次頁面載入打 24 次必失敗的請求」，把頁面拖到不能用。
+const corporateActionResultFailures = new Map();
+
+function normalizeCorporateActionResultRows(rows) {
+  const byCode = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    // 欄位順序：資料日期 / 股票代號 / 股票名稱 / 除權息前收盤價 / 除權息參考價 / 權值+息值 / 權息 / …
+    const exDate = toCompactDate(row?.[0]);
+    const code = cleanCode(row?.[1]);
+    const preClose = parsePositivePrice(row?.[3]);
+    const referencePrice = parsePositivePrice(row?.[4]);
+    if (!isValidCompactCalendarDate(exDate) || !SECURITY_CODE_PATTERN.test(code)) continue;
+    // 兩個價格缺一就沒有比率可言；不要留半筆讓下游以為「官方確認過」。
+    if (preClose === null || referencePrice === null) continue;
+    const slot = byCode.get(code) || {};
+    slot[exDate] = {
+      preClose,
+      referencePrice,
+      value: parseNumber(row?.[5]),
+      kind: normalizeDividendKind(row?.[6]),
+    };
+    byCode.set(code, slot);
+  }
+  return byCode;
+}
+
+// 往前推 n 個月的月初（只用來算「要補哪些月份」，不需要是實際交易日）。
+function compactMonthsBefore(compactDate, months) {
+  const compact = toCompactDate(compactDate) || toTaipeiCompactDate();
+  let year = Number(compact.slice(0, 4));
+  let month = Number(compact.slice(4, 6)) - months;
+  while (month < 1) { month += 12; year -= 1; }
+  return `${year}${String(month).padStart(2, "0")}01`;
+}
+
+function corporateActionResultMonthState(monthCompact) {
+  return fundamentalsHistory?.corporateActionResultMonths?.[monthCompact] || null;
+}
+
+// 封月（該月結束之後才抓的）＝資料完整且永遠不會再變；未封月的只在 TTL 內算數。
+function corporateActionResultMonthUsable(state) {
+  if (state?.status !== "ok") return false;
+  if (state.sealed) return true;
+  return Date.parse(state.observedAt || 0) + CORPORATE_ACTION_RESULT_CURRENT_TTL_MS > Date.now();
+}
+
+// TWSE RWD 對「查無符合資料」回 HTTP 200、`stat` 是一句中文抱歉、而且**完全沒有 data 欄位**
+// （2026-07-26 實測 20260901~20260931：`{"stat":"很抱歉，沒有符合條件的資料!"}`）。
+// 舊寫法只看 `Array.isArray(payload.data)`，於是這種回應被寫成「抓成功、零筆除權息」，
+// 配合上面的封月邏輯就是一個**永遠補不回來的空月**。
+// 真的沒有事件的月份長什麼樣？實測 2010-02 到 2026-06 共 10 個抽樣月份（含 2011-02、
+// 2012-02 這種只有 1 筆的淡月）**全部**是 `stat:"OK"` 且帶 data，找不到 stat 非 OK 的合法空月。
+// 所以這裡把 stat 非 OK 一律當上游失敗：最壞情況是某個真空月每 5 分鐘重試一次並亮降級警告，
+// 遠好過靜默把一整個月的除權息當成不存在。
+function corporateActionResultPayloadRows(payload) {
+  if (String(payload?.stat || "").trim().toUpperCase() !== "OK") return null;
+  return Array.isArray(payload?.data) ? payload.data : [];
+}
+
+async function loadCorporateActionResultMonth(monthCompact) {
+  const month = String(monthCompact || "").slice(0, 6);
+  if (!/^\d{6}$/.test(month)) return { status: "skipped", rows: 0 };
+  await loadFundamentalsHistory();
+  const state = corporateActionResultMonthState(month);
+  // 「過去月份永遠不會再變」只對**該月結束之後才抓的那一份**成立。當月抓的必然是半成品
+  // ——TWT49U 只公布到約 T+1（2026-07-26 查 202607，最後一列是 115年07月27日）。
+  // 舊寫法用 `month < currentMonth` 判斷，於是「7 月 3 日抓的 7 月」一跨到 8 月就被鎖成
+  // 永久真相，7 月 4 日之後的除權息再也補不回來。改成看抓取當下是不是已經跨月（sealed）。
+  // 既有歸檔沒有 sealed 欄位 → 一律當未封月重抓一次，正好把舊資料裡的半成品洗掉。
+  if (corporateActionResultMonthUsable(state)) {
+    return { status: "cached", rows: state.rows || 0 };
+  }
+  const failedAt = corporateActionResultFailures.get(month);
+  if (failedAt && failedAt + CORPORATE_ACTION_RESULT_RETRY_MS > Date.now()) {
+    return { status: "unavailable", rows: 0, error: "上游近期失敗，暫不重試" };
+  }
+  if (corporateActionResultInFlight.has(month)) return corporateActionResultInFlight.get(month);
+
+  const task = (async () => {
+    const start = `${month}01`;
+    const end = `${month}31`;
+    try {
+      // 刻意不重試（fetchJsonWithRetry 的退避是 900ms）。這條來源是「讓還原更精確」的增益，
+      // 而且抓成功的過去月份會永久落盤、失敗的月份 5 分鐘後自然會再試。
+      // 在這裡重試等於讓上游一掛掉，每次驗證推進與掃描都先空睡好幾秒——
+      // 補齊 5 個月 × 900ms 就讓 swing-verify 整合測試在滿載時超時（2026-07-27 實際踩到）。
+      const payload = await fetchJson(
+        `${CORPORATE_ACTION_RESULT_URL}?startDate=${start}&endDate=${end}&response=json`,
+        { headers: { "user-agent": "Mozilla/5.0" } },
+      );
+      const rows = corporateActionResultPayloadRows(payload);
+      if (rows === null) throw new Error(`上游回 stat=${String(payload?.stat || "").slice(0, 40)}`);
+      const byCode = normalizeCorporateActionResultRows(rows);
+      const history = await loadFundamentalsHistory();
+      history.corporateActionResults ||= {};
+      history.corporateActionResultMonths ||= {};
+      for (const [code, slot] of byCode) {
+        const target = (history.corporateActionResults[code] ||= {});
+        for (const [exDate, item] of Object.entries(slot)) target[exDate] = item;
+        // 每檔只留最近 40 筆：月配息 ETF 兩年就會累積 24 筆，12 筆的舊上限會把還原需要的資料吃掉。
+        const keys = Object.keys(target).sort();
+        while (keys.length > 40) delete target[keys.shift()];
+      }
+      history.corporateActionResultMonths[month] = {
+        status: "ok",
+        rows: rows.length,
+        codes: byCode.size,
+        observedAt: new Date().toISOString(),
+        // 抓取當下已經跨月＝這份資料是完整的、之後不會再變。
+        sealed: month < toTaipeiCompactDate().slice(0, 6),
+      };
+      await saveFundamentalsHistory();
+      corporateActionResultFailures.delete(month);
+      return { status: "fresh", rows: rows.length };
+    } catch (error) {
+      // 抓不到就沿用既有歸檔：這條來源是「讓還原更精確」的增益，不該讓整頁失敗。
+      corporateActionResultFailures.set(month, Date.now());
+      return { status: "unavailable", rows: 0, error: String(error?.message || error || "未知錯誤") };
+    }
+  })().finally(() => corporateActionResultInFlight.delete(month));
+  corporateActionResultInFlight.set(month, task);
+  return task;
+}
+
+// 把 [fromDate, throughDate] 涵蓋的月份補齊。呼叫端必須 await 過這個之後，
+// 才能用同步的 corporateActionResultFor() 查表。
+async function ensureCorporateActionResults(fromDate, throughDate) {
+  const from = toCompactDate(fromDate);
+  const through = toCompactDate(throughDate) || toTaipeiCompactDate();
+  if (!from) return { months: 0, degraded: false };
+  const months = [];
+  let year = Number(from.slice(0, 4));
+  let month = Number(from.slice(4, 6));
+  const endYear = Number(through.slice(0, 4));
+  const endMonth = Number(through.slice(4, 6));
+  while (year < endYear || (year === endYear && month <= endMonth)) {
+    months.push(`${year}${String(month).padStart(2, "0")}`);
+    month += 1;
+    if (month > 12) { month = 1; year += 1; }
+    if (months.length > CORPORATE_ACTION_RESULT_MAX_MONTHS * 4) break; // 參數壞掉時的煞車
+  }
+  // 上限要從**新的那一端**留。舊寫法在迴圈條件裡就停，砍掉的是離今天最近的月份
+  // ——那正是還原權息最需要的一段，而且被砍掉的月份根本沒進 results，degraded 還是 false。
+  const truncated = Math.max(0, months.length - CORPORATE_ACTION_RESULT_MAX_MONTHS);
+  const wanted = truncated ? months.slice(-CORPORATE_ACTION_RESULT_MAX_MONTHS) : months;
+  // 一次請求就涵蓋全市場所有代號，所以月份數就是請求數。冷啟動要補 24 個月，
+  // 序列化會讓第一次開頁等太久，並行度壓在 6 是「別把官方端點打爆」與「別卡住使用者」的折衷。
+  // 抓過的過去月份會落盤，之後每個月只會多一次請求。
+  const results = await mapLimit(wanted, CORPORATE_ACTION_RESULT_CONCURRENCY, (item) => loadCorporateActionResultMonth(item));
+  // 被上限砍掉的月份等同「沒抓到」，一樣要算降級——否則揭露機制會在最需要它的時候說「一切正常」。
+  const degraded = truncated > 0 || results.some((result) => result?.status === "unavailable");
+  return { months: wanted.length, degraded, truncated };
+}
+
+// 「這個月真的抓成功過」才算查得過。這道區分很重要：
+// 上市逐檔歷史的 X 標記說「這天有事件」，但比率要另外查計算結果表。若上游暫時掛掉，
+// 那是「沒查到」而不是「查了發現資料不完整」——把它當成 unresolved 會直接把一批大型股
+// 踢出候選池（2026-07-26 實測：整批抓取失敗時有 39 檔被誤剔，含聯電、緯創、台塑化、台化）。
+// 抓不到時維持舊行為（歸檔公式／跳空估算）並靠 warnings 揭露，不要因為上游打嗝就砍覆蓋率。
+function corporateActionResultMonthCovered(dateCompact) {
+  const month = String(toCompactDate(dateCompact) || "").slice(0, 6);
+  if (!/^\d{6}$/.test(month)) return false;
+  // 用與快取同一條「可用」判準：封月的永遠算數；當月抓的那一份只到 T+1，過期就不能再宣稱
+  // 「查得過」——否則月底那幾天的除權息會被當成「查了但拿不到比率」而誤標未定案。
+  return corporateActionResultMonthUsable(corporateActionResultMonthState(month));
+}
+
+function corporateActionResultFor(code, exDate) {
+  const slot = fundamentalsHistory?.corporateActionResults?.[cleanCode(code)];
+  const item = slot?.[toCompactDate(exDate)];
+  if (!item) return null;
+  const preClose = Number(item.preClose);
+  const referencePrice = Number(item.referencePrice);
+  if (!Number.isFinite(preClose) || preClose <= 0) return null;
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0) return null;
+  return { ...item, preClose, referencePrice };
+}
+
+// 交易所自己算的還原因子：參考價 ÷ 除權息前收盤價。
+// 比自己套公式可靠——它已經套過升降單位，也不需要現金／配股／現增四個欄位都齊備。
+function corporateActionResultRatio(code, exDate) {
+  const item = corporateActionResultFor(code, exDate);
+  if (!item) return null;
+  const ratio = item.referencePrice / item.preClose;
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : null;
+}
+
 async function buildFundamentals(codeRaw) {
   const code = cleanCode(codeRaw);
   const warnings = [];
@@ -4498,6 +5033,8 @@ async function buildFundamentals(codeRaw) {
   if (!liveRevenue && storedRevenue) warnings.unshift(`月營收來源暫時抓不到，已沿用本機最後保存的 ${storedRevenue.yearMonth || storedRevenue.period} 資料。`);
   if (!liveEps && storedEps) warnings.unshift(`EPS 來源暫時抓不到，已沿用本機最後保存的 ${storedEps.period} 資料。`);
   if (!liveValuation && storedValuation) warnings.unshift(`本益比／殖利率來源暫時抓不到，已沿用本機最後保存的 ${compactToSlashDate(storedValuation.asOf || storedValuation.period)} 資料。`);
+  // 比率量級異常是「資料可能整批算錯」等級的事，優先於各來源的新鮮度警告。
+  for (const warning of dividendMap.shapeWarnings || []) warnings.unshift(warning);
   const dividendSourcesToWarn = dividendSource
     ? [dividendSource]
     : Object.keys(DIVIDEND_SOURCES).filter((source) => dividendSourceStatus[source] !== "fresh");
@@ -4554,7 +5091,8 @@ function parseReferenceSnapshot(marketKey, rows, previous) {
   if (!Array.isArray(rows) || !rows.length) throw new Error(`${source.label}整批收盤回傳空資料`);
   const byCode = new Map();
   for (const row of rows) {
-    const quote = source.normalize(row);
+    // 除權息日的漲跌欄是可解析的 "0.0000"，要用官方參考價校正基準（見 applyCorporateActionQuoteBaseline）。
+    const quote = applyCorporateActionQuoteBaseline(source.normalize(row));
     if (quote.code && Number.isFinite(quote.price)) byCode.set(quote.code, quote);
   }
   if (!byCode.size) throw new Error(`${source.label}整批收盤沒有有效代號與價格`);
@@ -4569,32 +5107,12 @@ function parseReferenceSnapshot(marketKey, rows, previous) {
 }
 
 async function loadReferenceMarket(marketKey) {
-  const state = referenceMarketCache[marketKey];
   const source = REFERENCE_SOURCES[marketKey];
-  const now = Date.now();
-  if (state.value && state.expiresAt > now) return { status: "fresh", value: state.value, error: "" };
-  if (state.inFlight) return state.inFlight;
-  if (state.retryAt > now) {
-    return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-  }
-  state.inFlight = (async () => {
-    try {
-      const rows = await fetchJson(source.url);
-      const value = parseReferenceSnapshot(marketKey, rows, state.value);
-      state.value = value;
-      state.expiresAt = Date.now() + REFERENCE_TTL_MS;
-      state.retryAt = 0;
-      state.lastError = "";
-      return { status: "fresh", value, error: "" };
-    } catch (error) {
-      state.lastError = String(error?.message || error || "未知錯誤");
-      state.retryAt = Date.now() + REFERENCE_RETRY_MS;
-      return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-    }
-  })().finally(() => {
-    state.inFlight = null;
+  return loadWithLastGood(referenceMarketCache[marketKey], {
+    ttlMs: REFERENCE_TTL_MS,
+    retryMs: REFERENCE_RETRY_MS,
+    load: async (previous) => parseReferenceSnapshot(marketKey, await fetchJson(source.url), previous),
   });
-  return state.inFlight;
 }
 
 // 上市／上櫃各自 single-flight＋last-good。單一市場失敗時回部分成功與明確 warning；
@@ -4686,6 +5204,16 @@ async function getReferenceData() {
   return referenceInFlight;
 }
 
+// 兩個市場的「漲跌價差」欄在除權息日語意完全不同（2026-07-26 用真實 API 實測 60 檔）：
+//   TWSE：整欄被遮成 "X0.00"（X＝除權息，不計算漲跌）→ parseNumber 回 null。實測 28/28 檔皆然，
+//         非事件日一律是 "+0.30"／"-1.45" 這種正常數字。所以「close 有值但 change 解析不出來」
+//         在上市逐檔歷史裡就是交易所給的除權息日標記，涵蓋全部歷史（本機預告歸檔只從部署後累積）。
+//         實測 1140 列裡漏報 0 檔，還額外抓到台積電／鴻海／中華電等歸檔完全沒有的事件。
+//         但它只說「有事件」，不說比率——比率要另外查 TWT49U 計算結果表。
+//   TPEx：沒有任何標記，change 是相對除權息參考價算的正常數字 → close − change 就是官方參考價
+//         （實測 24/32 完全吻合，另 7 檔差在交易所把參考價套了升降單位）。
+// addPreviousClose 會把 previousClose 改寫成「前一列的收盤」，等於銷毀上面兩種官方資訊，
+// 所以另外保留一份 exchangePreviousClose，它永遠不被覆寫。
 function normalizeTwseHistoryRow(row, code, name) {
   const close = parseNumber(row[6]);
   const change = parseNumber(row[7]);
@@ -4701,6 +5229,9 @@ function normalizeTwseHistoryRow(row, code, name) {
     low: parseNumber(row[5]),
     close,
     previousClose,
+    exchangePreviousClose: previousClose,
+    // 有收盤價卻沒有漲跌價差＝官方的除權息日標記（上市限定）。
+    exchangeCorporateActionMark: close !== null && change === null,
     change,
     volumeShares: parseNumber(row[1]),
     volumeLots: Math.round((parseNumber(row[1]) || 0) / 1000),
@@ -4726,6 +5257,9 @@ function normalizeTpexHistoryRow(row, code, name) {
     low: parseNumber(row[5]),
     close,
     previousClose,
+    // 上櫃沒有 X 標記，但 change 是相對參考價算的，所以這個值在除權息日就是官方參考價。
+    exchangePreviousClose: previousClose,
+    exchangeCorporateActionMark: false,
     change,
     volumeShares: volumeLots !== null ? volumeLots * 1000 : null,
     volumeLots,
@@ -4774,10 +5308,33 @@ async function fetchStockHistoryMonth(code, exchange, monthCompact, name = "") {
   return task;
 }
 
+// Yahoo 自己回報的分割事件。這是「Yahoo 到底對這檔做了什麼調整」的權威來源——
+// 它的 indicators.quote 已經把台股配股當成分割還原過（實測 6944 回 1300:1000＝配股 30%），
+// 而我們要把官方座標系的還原因子換算到 Yahoo 座標系時，需要的正是「Yahoo 實際套了多少」，
+// 不是「真實的配股率」。用它比用本機歸檔的公告更準，也不需要歸檔剛好有那一筆。
+// 2026-07-27 實測：split 時間戳換算成台北日期正好等於除權息日；純現金個股（2002 中鋼）
+// 有 events 區塊但沒有 splits 鍵 → 代表「Yahoo 確認沒有做分割調整」，倍數應視為 1。
+function parseYahooSplitFactors(result) {
+  const events = result?.events;
+  if (!events) return null; // 整個 events 區塊都沒回 → 不能斷言 Yahoo 沒調整
+  const byDate = new Map();
+  for (const split of Object.values(events.splits || {})) {
+    const compact = toCompactDate(new Date(Number(split?.date) * 1000));
+    const numerator = parseNumber(split?.numerator);
+    const denominator = parseNumber(split?.denominator);
+    if (!isValidCompactCalendarDate(compact)) continue;
+    if (!Number.isFinite(numerator) || numerator <= 0) continue;
+    if (!Number.isFinite(denominator) || denominator <= 0) continue;
+    byDate.set(compact, numerator / denominator);
+  }
+  return byDate;
+}
+
 function normalizeYahooHistoryRows(payload, quote, maxDateCompact) {
   const result = payload?.chart?.result?.[0];
   const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
   const quoteBlock = result?.indicators?.quote?.[0] || {};
+  const splitFactors = parseYahooSplitFactors(result);
   const rows = [];
   for (let index = 0; index < timestamps.length; index += 1) {
     const date = new Date(Number(timestamps[index]) * 1000);
@@ -4800,6 +5357,13 @@ function normalizeYahooHistoryRows(payload, quote, maxDateCompact) {
       low,
       close,
       previousClose: null,
+      // Yahoo 沒有「交易所昨收」這個概念，而且它的原始 OHLC 已經自己把配股當分割還原過
+      // （2026-07-26 實測），語意跟官方逐檔歷史不同，不可混用。
+      exchangePreviousClose: null,
+      exchangeCorporateActionMark: false,
+      // Yahoo 對這一天實際套用的分割倍數。有 events 區塊卻沒列這天＝Yahoo 沒調整（倍數 1）；
+      // 整個 events 區塊都沒回才是 null（未知），此時不可假設它沒調整。
+      yahooSplitFactor: splitFactors ? (splitFactors.get(compact) ?? 1) : null,
       change: null,
       volumeShares,
       volumeLots: volumeShares !== null ? Math.round(volumeShares / 1000) : null,
@@ -4820,7 +5384,10 @@ function normalizeYahooHistoryRows(payload, quote, maxDateCompact) {
 async function fetchYahooHistory(quote, dateCompact, range = "2y") {
   const suffix = quote.exchange === "TPEx" ? "TWO" : "TW";
   const symbol = `${quote.code}.${suffix}`;
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${encodeURIComponent(range)}&interval=1d`;
+  // events=div|split：要 Yahoo 一併回報它自己認定的分割與配息事件。分割倍數是把官方還原因子
+  // 換算到 Yahoo 座標系的必要輸入（見 parseYahooSplitFactors），少了它，有配股又不在本機
+  // 歸檔裡的股票會整檔被判 unresolved 而從板子上消失。
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${encodeURIComponent(range)}&interval=1d&events=div%7Csplit`;
   const payload = await fetchJson(url, {
     headers: {
       "user-agent": "Mozilla/5.0",
@@ -5003,6 +5570,27 @@ async function saveSurveillanceHistory() {
 const RISK_SOURCE_FRESH_MS = 60 * 60 * 1000;
 const RISK_SOURCE_STALE_MS = 26 * 60 * 60 * 1000;
 
+// 上市注意股端點（`/announcement/notice`，官方說明就寫「集中市場**當日**公布注意股票」）
+// 在沒有當日公布時**不是回空陣列，而是回一列所有欄位都是空字串／"0" 的哨兵**
+// （2026-07-26 實測：`{"Number":"0","Code":"","Name":"","NumberOfAnnouncement":"0",…}`）。
+// 舊寫法用 `/^\d{4}$/` 過濾代號，哨兵被靜默濾掉 → 變成「今天沒有任何上市注意股」這個**事實陳述**。
+//
+// 這不是假想問題：本機 45 天快照裡 11 個日子共 299 筆注意股，**上市 0 筆、上櫃 299 筆**
+// （兩份官方 4 碼清單零重疊，分類可靠）。上市 1,092 檔／上櫃 889 檔，連續 11 天上市掛零
+// 而上櫃每天 16~39 檔，機率上不可能——同期 `/announcement/notetrans` 還回著
+// 「115年7月23日至115年7月24日連續二次」，證明上市那兩天確實公布過注意資訊。
+// 也就是說這份名單一直是空的，而畫面把它當成「乾淨」。
+//
+// 同一類陷阱在這個專案已經記錄過三次（逐月歷史的 `X0.00`、MIS 的 `0.0000`、
+// 整批收盤的 `Change:"0.0000"`）：**上游用「看得像資料的東西」表達「沒有資料」**。
+// 回 null 代表「拿不到」，讓呼叫端走 last-good ＋ 警告，而不是宣稱零。
+function twseNoticeRowsOrNull(rows) {
+  if (!Array.isArray(rows)) return null;
+  if (!rows.length) return rows;               // 真正的空陣列（RWD 版就是這樣回）→ 尊重它
+  const usable = rows.filter((row) => /^\d{4,6}$/.test(cleanCode(row?.Code)));
+  return usable.length ? usable : null;        // 有列但沒有一個代號 → 哨兵，不是零
+}
+
 async function resolveRiskSource(name, fetcher, warnings) {
   const cached = riskSourceMemory.get(name);
   const cacheAge = cached ? Date.now() - new Date(cached.fetchedAt).getTime() : Infinity;
@@ -5067,14 +5655,29 @@ async function loadRiskSets(riskDate) {
       name: "TWSE 注意股",
       fetcher: async () => {
         const rows = await fetchJsonWithRetry("https://openapi.twse.com.tw/v1/announcement/notice");
-        return rows.map((r) => cleanCode(r.Code)).filter((code) => /^\d{4}$/.test(code));
+        const usable = twseNoticeRowsOrNull(rows);
+        // 拿不到就要拋，讓 resolveRiskSource 走 last-good ＋ 警告；靜默回 [] 等於宣稱「沒有注意股」。
+        if (usable === null) throw new Error("官方只回了空白哨兵列，當日名單尚未公布或已清空");
+        return usable.map((r) => cleanCode(r.Code)).filter((code) => /^\d{4}$/.test(code));
       },
     },
     {
+      // 處置公告清單同時含「已結束」與「尚未開始」的列——看板自己就把它切成即將處置／
+      // 處置中／即將出關三桶，代表程式早就預期清單裡有非當期的列。這裡以前卻無條件全收，
+      // 已出關的股票今天仍被標「處置・分盤・預收」，開了隱藏開關還會誤刪正常交易的標的。
+      // 日期窗在消費端套用（見下方迴圈）而不是塞進 fetcher：riskSourceMemory 以 name 為鍵
+      // 並持久化，若把結果變成跟日期相關就必須把 riskDate 加進 name，last-good 會變成每日
+      // 獨立、上游失敗時反而沒有備援。改用既有的 `code|...` 字串慣例夾帶期間。
       name: "TWSE 處置股",
+      windowed: true,
       fetcher: async () => {
         const rows = await fetchJsonWithRetry("https://openapi.twse.com.tw/v1/announcement/punish");
-        return rows.map((r) => cleanCode(r.Code)).filter((code) => /^\d{4}$/.test(code));
+        return rows
+          .map((r) => {
+            const period = parseDispositionPeriod(r.DispositionPeriod);
+            return `${cleanCode(r.Code)}|${period.start}|${period.end}`;
+          })
+          .filter((entry) => /^\d{4}\|/.test(entry));
       },
     },
     {
@@ -5093,9 +5696,15 @@ async function loadRiskSets(riskDate) {
     },
     {
       name: "TPEx 處置股",
+      windowed: true,
       fetcher: async () => {
         const rows = await fetchJsonWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_disposal_information");
-        return rows.map((row) => cleanCode(row.SecuritiesCompanyCode)).filter((code) => /^\d{4}$/.test(code));
+        return rows
+          .map((row) => {
+            const period = parseDispositionPeriod(row.DispositionPeriod);
+            return `${cleanCode(row.SecuritiesCompanyCode)}|${period.start}|${period.end}`;
+          })
+          .filter((entry) => /^\d{4}\|/.test(entry));
       },
     },
     {
@@ -5167,10 +5776,17 @@ async function loadRiskSets(riskDate) {
   ];
 
   await Promise.all([
-    ...sources.map(async ({ name, fetcher }) => {
-      const codes = await resolveRiskSource(name, fetcher, warnings);
+    ...sources.map(async ({ name, fetcher, windowed = false }) => {
+      const entries = await resolveRiskSource(name, fetcher, warnings);
       const info = classifySurveillance(name);
-      for (const code of codes) {
+      for (const entry of entries) {
+        // 一般來源存純代號；windowed 來源存 `code|起日|迄日`（沿用停牌來源的 `|` 慣例）。
+        // 舊的 risk-cache.json 只有純代號，讀到時 start/end 為空 → 保留，向後相容。
+        const [code, start = "", end = ""] = String(entry).split("|");
+        if (!/^\d{4}$/.test(code)) continue;
+        // 期間可解析且不涵蓋基準日 → 已出關或尚未開始，今天不該掛處置標籤。
+        // 期間解析不出來時保守保留：對風險標籤而言，寧可多標也不要漏標。
+        if (windowed && start && end && !(start <= riskDate && riskDate <= end)) continue;
         const prev = surveillance.get(code);
         if (!prev || SURVEILLANCE_RANK[info.kind] > SURVEILLANCE_RANK[prev.kind]) {
           surveillance.set(code, info);
@@ -5226,6 +5842,19 @@ const openapiHeaders = {
 function parseDispositionPeriod(text) {
   const parts = String(text || "").split(/[~～至]/);
   return { start: toCompactDate(parts[0] || ""), end: toCompactDate(parts[1] || parts[0] || "") };
+}
+// TPEx 的鉅額與變更交易端點回的是「最近一個公布日」的整批資料，不是可以指定日期的查詢。
+// 以前硬比對日曆今天（toTaipeiCompactDate），於是週末、國定假日與盤中尚未公布的時段，
+// 這兩類就只剩上市股票、上櫃整批消失，counts 跟著少算，畫面卻仍標著今天的日期——
+// 看起來像「上櫃今天真的沒有全額交割股」。改成取 payload 內「不晚於查詢日的最新日期」。
+function latestUpstreamDate(rows, getDate, notAfter = "") {
+  let latest = "";
+  for (const row of rows || []) {
+    const date = toCompactDate(getDate(row));
+    if (!date || (notAfter && date > notAfter)) continue;
+    if (date > latest) latest = date;
+  }
+  return latest;
 }
 // 分盤間隔：處置內容含「每5/五分鐘」→5、「每20/二十分鐘」→20
 function parseDispositionInterval(text) {
@@ -5380,10 +6009,20 @@ async function getSurveillanceBoard(dateCompact) {
   // ---- 注意（TWSE notice + TPEx warning）----
   const twseNotice = await survFetchRecords("twseNotice", today, "TWSE 注意", warnings, async () => {
     const rows = await fetchJsonWithRetry("https://openapi.twse.com.tw/v1/announcement/notice", { headers: openapiHeaders });
-    return (rows || []).map((r) => {
+    const usable = twseNoticeRowsOrNull(rows);
+    if (usable === null) throw new Error("官方只回了空白哨兵列，當日名單尚未公布或已清空");
+    return usable.map((r) => {
       const code = cleanCode(r.Code);
       if (!/^\d{4}$/.test(code)) return null;
-      return { code, market: "TWSE", count: Number(r.NumberOfAnnouncement) || 1, reason: String(r.TradingInfoForAttention || "").trim() };
+      // `Date` 欄位官方確實有給（D-44 原記錄說「沒有期間欄位」不精確）——它是**公布日**而不是期間。
+      // 對照組：處置股的 tpex_disposal_information 給的是 `DispositionPeriod: "1150727~1150807"`。
+      // 注意交易資訊本質上是「逐日公布」的旗標，沒有期間可言，所以 D-08 不給它加日期窗是對的；
+      // 但公布日必須保留，否則無法分辨這份名單是今天的還是沿用舊的。
+      return {
+        code, market: "TWSE", count: Number(r.NumberOfAnnouncement) || 1,
+        reason: String(r.TradingInfoForAttention || "").trim(),
+        noticeDate: toCompactDate(r.Date) || "",
+      };
     }).filter(Boolean);
   });
   const tpexWarning = await survFetchRecords("tpexWarning", today, "TPEx 注意", warnings, async () => {
@@ -5391,7 +6030,11 @@ async function getSurveillanceBoard(dateCompact) {
     return (rows || []).map((r) => {
       const code = cleanCode(r.SecuritiesCompanyCode);
       if (!/^\d{4}$/.test(code)) return null;
-      return { code, market: "TPEx", count: 1, reason: String(r.TradingInformation || "").trim() };
+      // 上櫃同樣有公布日（民國 "1150724"），兩邊都留下來才比對得出「哪一邊沿用了舊名單」。
+      return {
+        code, market: "TPEx", count: 1, reason: String(r.TradingInformation || "").trim(),
+        noticeDate: toCompactDate(r.Date) || "",
+      };
     }).filter(Boolean);
   });
   const attMap = new Map();
@@ -5418,13 +6061,15 @@ async function getSurveillanceBoard(dateCompact) {
   });
   const blockTpex = await survFetchRecords("blockTpex", today, "TPEx 鉅額交易", warnings, async () => {
     const rows = await fetchJsonWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_daily_qutoes_block");
+    // 取上游最近一個公布日（不晚於查詢日），而不是硬比對日曆今天——否則非交易日整批消失。
+    const sourceDate = latestUpstreamDate(rows, (r) => r.Date, today);
     const agg = new Map();
     for (const r of rows || []) {
       const code = cleanCode(r.Code);
       if (!/^\d{4}$/.test(code)) continue;
-      if (toCompactDate(r.Date) !== today) continue; // 只取當日（和 TWSE date=today 一致）
+      if (!sourceDate || toCompactDate(r.Date) !== sourceDate) continue;
       const value = Number(String(r.TradeValue || "").replace(/,/g, "")) || 0;
-      const o = agg.get(code) || { code, name: String(r.Name || "").trim(), count: 0, value: 0 };
+      const o = agg.get(code) || { code, name: String(r.Name || "").trim(), count: 0, value: 0, asOf: sourceDate };
       o.count += 1;
       o.value += value;
       agg.set(code, o);
@@ -5454,14 +6099,26 @@ async function getSurveillanceBoard(dateCompact) {
   });
   const changedTpex = await survFetchRecords("changedTpex", today, "TPEx 全額交割", warnings, async () => {
     const rows = await fetchJsonWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_cmode");
+    const sourceDate = latestUpstreamDate(rows, (r) => r.Date, today); // 同上：不硬比對日曆今天
+    if (!sourceDate) return [];
     return (rows || [])
-      .filter((r) => ["Ｙ", "Y"].includes(String(r.AlteredTrading || "").trim()) && toCompactDate(r.Date) === today) // 變更交易方法＝全額交割
+      .filter((r) => ["Ｙ", "Y"].includes(String(r.AlteredTrading || "").trim()) && toCompactDate(r.Date) === sourceDate) // 變更交易方法＝全額交割
       .map((r) => {
         const code = cleanCode(r.SecuritiesCompanyCode);
         if (!/^\d{4}$/.test(code)) return null;
-        return { code, market: "TPEx", srcName: String(r.CompanyName || "").trim(), periodic: String(r.PeriodicTrading || "").trim() !== "" };
+        return { code, market: "TPEx", srcName: String(r.CompanyName || "").trim(), periodic: String(r.PeriodicTrading || "").trim() !== "", asOf: sourceDate };
       }).filter(Boolean);
   });
+  // 上櫃兩類的資料日若落後查詢日（非交易日、或當日尚未公布），必須明講——否則使用者會
+  // 以為「上櫃今天真的沒有鉅額／全額交割」。只在「確實有資料但日期較舊」時警告；
+  // 完全沒有列時無法分辨「當天真的沒有」與「上游還沒公布」，不編造結論。
+  for (const [label, records] of [["鉅額交易", blockTpex], ["全額交割", changedTpex]]) {
+    const sourceDate = records.find((record) => record.asOf)?.asOf || "";
+    if (sourceDate && sourceDate !== today) {
+      warnings.push(`上櫃${label}目前是 ${compactToSlashDate(sourceDate)} 的公布資料（查詢日 ${compactToSlashDate(today)}）。`);
+    }
+  }
+
   const changedMap = new Map();
   for (const rec of [...changedTwse, ...changedTpex]) if (!changedMap.has(rec.code)) changedMap.set(rec.code, rec);
   const changedTrading = [...changedMap.values()]
@@ -5521,14 +6178,59 @@ async function getSurveillanceBoard(dateCompact) {
   }
 
   // ---- 歷史快照差異：今日新進/出關、注意升溫、連續天數 ----
-  const hadHardFailure = warnings.some((w) => w.includes("抓取失敗："));
+  // 抓取失敗要**分類別**看。舊寫法一刀切（任何來源失敗 → prev 設 null、整份歷史停更），
+  // 在「TWSE 注意股端點長期只回空白哨兵列」被揭露出來之後（見 twseNoticeRowsOrNull），
+  // 等於把新進／出關／連 N 天／接近處置門檻**永久關掉**——而處置、全額交割、鉅額那幾類的
+  // 資料其實是完整的，沒有理由陪葬。
+  //   失敗的類別 → 不比對（避免把抓不到誤判成出關），也不寫進今天的快照（避免明天看到假新進）。
+  //   成功的類別 → 照常比對與落盤。
+  const SURVEILLANCE_HISTORY_FIELDS = [
+    { field: "disposition", match: /處置/ },
+    { field: "attention", match: /注意/ },
+    { field: "block", match: /鉅額/ },
+    { field: "changed", match: /全額交割/ },
+  ];
+  const failedFields = new Set();
+  for (const warning of warnings) {
+    const at = warning.indexOf("抓取失敗：");
+    if (at < 0) continue;
+    const label = warning.slice(0, at);
+    for (const { field, match } of SURVEILLANCE_HISTORY_FIELDS) if (match.test(label)) failedFields.add(field);
+  }
+  const hadHardFailure = failedFields.size > 0;
   if (hadHardFailure) {
-    warnings.push("部分公告來源目前沒有可用資料，本次不更新每日歷史，也不計算新進／出關，避免把抓取失敗誤判成名單異動。");
+    const names = SURVEILLANCE_HISTORY_FIELDS
+      .filter(({ field }) => failedFields.has(field))
+      .map(({ match }) => String(match.source));
+    warnings.push(`${names.join("、")}的公告來源目前沒有可用資料，這幾類本次不更新每日歷史、也不計算出關`
+      + "（避免把抓取失敗誤判成名單異動）；其餘類別照常比對。");
   }
   const history = await loadSurveillanceHistory();
   const pastDates = Object.keys(history).filter((d) => d < today).sort();
-  const comparisonAsOf = !hadHardFailure && pastDates.length ? pastDates.at(-1) : "";
+  const comparisonAsOf = pastDates.length ? pastDates.at(-1) : "";
   const prev = comparisonAsOf ? history[comparisonAsOf] : null;
+  // 兩種問題要分開，否則會關掉本來可信的資訊：
+  //  (a) 對照快照**根本沒有這個欄位**（先前那一輪失敗被省略）→ 完全不能比，
+  //      否則今天整批都會被標成「新進」。
+  //  (b) 這一輪某個來源抓不到 → 該市場的代號今天整批缺席。這時
+  //      **「新進」與「連 N 天」仍然可信**——今天出現在名單上的代號，它前一份快照在不在，
+  //      是查得到的事實（缺席的市場在雙邊都缺席，不會產生假訊號）；
+  //      但**「出關」不可信**，因為代號消失可能只是因為抓不到，不是真的解除。
+  // 實例：TWSE 注意股端點長期只回哨兵列，歷史快照裡本來就只有上櫃代號，
+  // 那 14 檔上櫃注意股的連續天數是真的，沒有理由一起關掉。
+  // 還有第三個條件：**名單組成必須一致**。拿「缺了上市那一半」的名單跟「完整」的名單比，
+  // 會把整批上市股當成新進。所以快照要記下當時哪幾類是不完整的（partial），
+  // 只在組成相同時才比對。這讓長期缺一個市場的類別（例如上市注意股端點一直只回哨兵列）
+  // 仍然能對上櫃那半算連續天數，而不是整個功能停擺；等哪天上市端點恢復，
+  // 組成不一致會自動擋掉那一次比對，不會爆出一批假新進。
+  // 而且組成不一致的風險是**單向**的：
+  //   對照不完整 ＋ 今天完整 → 對照缺的那些代號今天全部看起來像「新進」→ 必須擋。
+  //   對照完整 ＋ 今天不完整 → 今天的代號是對照的子集，「它昨天在不在」照樣查得到 → 可以比。
+  // （這與 D-24 的裁決同一個形狀：看起來對稱的兩種情形，實際上只有一邊會產生假訊號。）
+  const prevPartial = new Set(prev?.partial || []);
+  const canCompare = (field) => Boolean(prev) && prev[field] !== undefined
+    && !(prevPartial.has(field) && !failedFields.has(field));
+  const canTrustRemovals = (field) => canCompare(field) && !failedFields.has(field);
   const comparisonIsPreviousTradingDay = Boolean(
     comparisonAsOf && resolveNextTradingDate(comparisonAsOf, tradingCalendar).date === today
   );
@@ -5548,46 +6250,64 @@ async function getSurveillanceBoard(dateCompact) {
   };
   const dispItems = [...aboutToDispose, ...inDisposition]; // aboutToRelease 與 inDisposition 共用同一批物件
   const dispCodesToday = new Set(dispItems.map((i) => i.code));
+  const newLabelFor = () => (comparisonIsPreviousTradingDay ? "今日新進" : `較 ${compactToIsoDate(comparisonAsOf)} 新增`);
+  const compareDisposition = canCompare("disposition");
   for (const it of dispItems) {
-    it.isNew = prev ? !(prev.disposition || []).includes(it.code) : false;
-    it.newLabel = it.isNew
-      ? (comparisonIsPreviousTradingDay ? "今日新進" : `較 ${compactToIsoDate(comparisonAsOf)} 新增`)
-      : "";
+    it.isNew = compareDisposition ? !(prev.disposition || []).includes(it.code) : false;
+    it.newLabel = it.isNew ? newLabelFor() : "";
   }
+  const compareAttention = canCompare("attention");
   for (const it of attention) {
-    const prevCount = prev && prev.attention ? prev.attention[it.code] : undefined;
-    it.isNew = prev ? !(prev.attention && it.code in prev.attention) : false;
-    it.newLabel = it.isNew
-      ? (comparisonIsPreviousTradingDay ? "今日新進" : `較 ${compactToIsoDate(comparisonAsOf)} 新增`)
-      : "";
-    it.daysOnList = consecutiveDays(it.code, "attention");
+    const prevCount = compareAttention ? prev.attention?.[it.code] : undefined;
+    it.isNew = compareAttention ? !(prev.attention && it.code in prev.attention) : false;
+    it.newLabel = it.isNew ? newLabelFor() : "";
+    it.daysOnList = compareAttention ? consecutiveDays(it.code, "attention") : null;
     const rising = comparisonIsPreviousTradingDay && prevCount != null && Number(it.count || 0) > Number(prevCount);
     // 接近處置門檻（謹慎、僅供參考）：注意累計次數偏高，或連續多日在注意且次數還在升。
-    it.nearDisposition = Number(it.count || 0) >= 3 || (rising && it.daysOnList >= 2);
+    // 累計次數是這一輪官方給的，即使比對不成立也仍然可信，所以那一半照算。
+    it.nearDisposition = Number(it.count || 0) >= 3 || (rising && Number(it.daysOnList || 0) >= 2);
   }
+  const compareChanged = canCompare("changed");
   for (const it of changedTrading) {
-    it.isNew = prev ? !(prev.changed || []).includes(it.code) : false;
-    it.newLabel = it.isNew
-      ? (comparisonIsPreviousTradingDay ? "今日新進" : `較 ${compactToIsoDate(comparisonAsOf)} 新增`)
-      : "";
+    it.isNew = compareChanged ? !(prev.changed || []).includes(it.code) : false;
+    it.newLabel = it.isNew ? newLabelFor() : "";
   }
-  const prevDisp = new Set(prev?.disposition || []);
-  const enteredSinceComparison = prev ? [...dispCodesToday].filter((c) => !prevDisp.has(c)).length : 0;
-  const releasedSinceComparison = prev ? [...prevDisp].filter((c) => !dispCodesToday.has(c)).length : 0;
+  const prevDisp = new Set(compareDisposition ? prev.disposition || [] : []);
+  const enteredSinceComparison = compareDisposition ? [...dispCodesToday].filter((c) => !prevDisp.has(c)).length : 0;
+  // 出關必須用更嚴的判準：代號從名單消失，可能只是這一輪抓不到。
+  const releasedSinceComparison = canTrustRemovals("disposition")
+    ? [...prevDisp].filter((c) => !dispCodesToday.has(c)).length
+    : 0;
   const enteredToday = comparisonIsPreviousTradingDay ? enteredSinceComparison : 0;
   const releasedToday = comparisonIsPreviousTradingDay ? releasedSinceComparison : 0;
 
-  // 只有全部公告來源都有「本次資料或同日 last-good」才寫歷史；否則空陣列會製造假出關。
-  if (!hadHardFailure && todayIsTradingDay) {
-    history[today] = {
+  // 落盤時把「哪幾類不完整」一起記下來（partial），組成不同的兩份名單才不會被拿來互比。
+  // 不完整的那一類仍然寫入——長期缺一個市場時（例如上市注意股端點只回哨兵列）省略會讓
+  // 隔天完全比不了，寫進去反而能讓上櫃那半持續算連續天數。
+  // 同一交易日先抓到的真實資料不因後來失敗而丟掉，所以用 merge 而不是覆寫。
+  if (todayIsTradingDay) {
+    const snapshot = {
       disposition: [...dispCodesToday],
       attention: Object.fromEntries(attention.map((i) => [i.code, Number(i.count || 1)])),
       changed: changedTrading.map((i) => i.code),
       block: blockTrades.map((i) => i.code),
     };
+    // 同一天內若某類別先前那一輪是完整的，就別讓這一輪的殘缺名單蓋過去。
+    const previousToday = history[today] || {};
+    const previousTodayPartial = new Set(previousToday.partial || []);
+    const partial = [];
+    for (const { field } of SURVEILLANCE_HISTORY_FIELDS) {
+      const wasComplete = previousToday[field] !== undefined && !previousTodayPartial.has(field);
+      if (failedFields.has(field) && wasComplete) {
+        snapshot[field] = previousToday[field];   // 保留先前完整的那一份
+        continue;
+      }
+      if (failedFields.has(field) || previousTodayPartial.has(field)) partial.push(field);
+    }
+    history[today] = { ...previousToday, ...snapshot, ...(partial.length ? { partial } : {}) };
     for (const k of Object.keys(history).sort().slice(0, -45)) delete history[k];
     await saveSurveillanceHistory();
-  } else if (!hadHardFailure) {
+  } else {
     warnings.push("今天不是排定交易日，本次只顯示公告，不新增每日快照或連續日數。");
   }
 
@@ -5609,7 +6329,13 @@ async function getSurveillanceBoard(dateCompact) {
       changedTrading: changedTrading.length,
     },
     aboutToDispose, inDisposition, aboutToRelease, attention, blockTrades, changedTrading,
-    hasHistory: !!prev,
+    // 「有沒有可用的歷史比對」——至少一個類別真的比對得出來才算，不是單看 prev 存不存在。
+    hasHistory: SURVEILLANCE_HISTORY_FIELDS.some(({ field }) => canCompare(field)),
+    // 完全無法比對的類別（對照快照缺該欄位）：這些的「新進」一律不標。
+    staleHistoryFields: SURVEILLANCE_HISTORY_FIELDS.filter(({ field }) => !canCompare(field)).map(({ field }) => field),
+    // 可以比「新進」但不能比「出關」的類別（這一輪來源抓不到，代號消失不代表解除）。
+    unreliableRemovalFields: SURVEILLANCE_HISTORY_FIELDS
+      .filter(({ field }) => canCompare(field) && !canTrustRemovals(field)).map(({ field }) => field),
     enteredToday,
     releasedToday,
     enteredSinceComparison,
@@ -5736,8 +6462,20 @@ async function getQuotes(codes) {
       const y = await fetchYahooQuote(code, ref?.exchange);
       if (!y || !Number.isFinite(y.price) || y.rawDate !== toTaipeiCompactDate()) return;
       const base = realtimeQuotes.get(code) || ref || {};
-      const previousClose = Number.isFinite(Number(base.previousClose)) ? Number(base.previousClose) : y.previousClose;
+      // base 可能是「前一交易日」的整批收盤（盤中 STOCK_DAY_ALL 還沒推進，且 MIS 這輪沒回這檔）。
+      // 那份 previousClose 是「前前一個交易日」的收盤，拿來配今天的 Yahoo 價會把漲跌算成兩天份。
+      const baseDate = toCompactDate(base.rawDate || base.asOf || "");
+      const baseIsSameDay = Boolean(baseDate) && baseDate === y.rawDate;
+      // previousClose 是價格欄位，必須走 parsePositivePrice：base.previousClose 合法為 null
+      //（官方整批列的 Change 是 "--"、或 MIS 沒有 y 值時），Number(null)===0 是有限值，
+      // 舊寫法會挑到 0 而讓 change 變成「整個股價」，changePct 又因為 0 falsy 靜靜變 null。
+      const previousClose = (baseIsSameDay ? parsePositivePrice(base.previousClose) : null)
+        ?? y.previousClose ?? null;
       const change = previousClose != null ? roundTo(y.price - previousClose) : null;
+      // 量能欄位同理：不同交易日的量不能冠上今天的日期。Yahoo chart meta 沒有可用成交量，只能標未知。
+      const staleVolumeFields = baseIsSameDay
+        ? {}
+        : { volumeLots: null, transactions: null, unitLots: null, turnoverPct: null };
       const sameDayIntraday = Boolean(base.officialIntraday)
         && toCompactDate(base.officialIntraday.date) === y.rawDate;
       realtimeQuotes.set(code, {
@@ -5754,6 +6492,7 @@ async function getQuotes(codes) {
         open: sameDayIntraday ? base.officialIntraday.open : y.open,
         high: sameDayIntraday ? base.officialIntraday.high : y.high,
         low: sameDayIntraday ? base.officialIntraday.low : y.low,
+        ...staleVolumeFields,
       });
     });
   }
@@ -5795,8 +6534,11 @@ async function getQuotes(codes) {
     requestedCodes: normalizedCodes,
     quoteCount: quotes.length,
     source: realtimeQuotes.size ? "TWSE MIS + official daily close fallback" : "Official daily close fallback",
-    realtimeCount: realtimeQuotes.size,
-    fallbackCount: quotes.length - realtimeQuotes.size,
+    // priceStale=true 代表即時源沒有有效成交價、已退回官方收盤——那不是「即時」。
+    // 舊寫法用 realtimeQuotes.size 會把它們算進即時，資料可信度指標顯示「即時 N 檔／收盤備援 0 檔」
+    // 且判定為良好，但畫面上其實有數十檔掛著「收盤」在顯示昨收。券商路徑本來就用這個語意判斷。
+    realtimeCount: quotes.filter((quote) => quote.sourceKind === "realtime" && quote.priceStale !== true).length,
+    fallbackCount: quotes.filter((quote) => !(quote.sourceKind === "realtime" && quote.priceStale !== true)).length,
     realtimeError,
     referenceCounts: reference.counts,
     missingCodes: normalizedCodes.filter((code) => !quotes.some((quote) => quote.code === code)),
@@ -6555,7 +7297,10 @@ function scoreReversal(metrics) {
 
 function buildRiskTags(metrics) {
   const tags = [];
-  if (!metrics.tradeValue || metrics.tradeValue < 30_000_000) tags.push("低流動性");
+  // 「查不到成交值」和「成交值真的很低」是兩件事，不能都叫低流動性——舊寫法用 falsy 判斷，
+  // 當日 K 缺 tradeValue 時整份清單每一檔都會掛低流動性，標籤變雜訊、真正的警示跟著失效。
+  if (!Number.isFinite(metrics.tradeValue)) tags.push("成交值未知");
+  else if (metrics.tradeValue < 30_000_000) tags.push("低流動性");
   if (metrics.volumeRatio5 >= 5) tags.push("爆量過熱");
   if (metrics.amplitudePct >= 8) tags.push("高振幅");
   if (metrics.closePosition < 0.45) tags.push("收盤轉弱");
@@ -6663,6 +7408,7 @@ function summarizeRecentBacktest(history, group, days = 30) {
     avgOpenReturn: average(performances.map((item) => item.openReturn)),
     avgHighReturn: average(performances.map((item) => item.highReturn)),
     avgCloseReturn: average(performances.map((item) => item.closeReturn)),
+    avgCloseReturnNet: netReturnPct(average(performances.map((item) => item.closeReturn))),
     brokeMinus2Rate: performances.filter((item) => item.brokeMinus2).length / performances.length,
   };
 }
@@ -6696,6 +7442,13 @@ function buildPick(metrics, groupInfo, nextDay = null, recentBacktest = null) {
   };
 }
 
+// 隔日沖候選池的絕對成交量下限（D-33，2026-07-26 使用者拍板）。
+// 為什麼需要：排序權重是 |漲跌%| × log10(量+10)，量那一項的值域只有 1~5，壓不過 0~10 的
+// 漲幅項——冷門股靠「相對爆量」很容易擠進 260 檔，而候選池有上限，它們會**擠掉**流動性
+// 好的股票。實測基準日 2026-07-24：6103 合邦整天成交 5 張（17 萬元）拿到 78 分登上強勢續攻。
+// 門檻刻意設得低（波段是 500 張）：只擋「真的買不到」的，其餘維持「低流動性」標籤讓使用者
+// 自己判斷，與注意／處置股「顯示＋標示」的政策一致。實測 260 檔候選池擋掉 12 檔、上板少 3 檔。
+const OVERNIGHT_MIN_VOLUME_LOTS = 100;
 function preselectQuotes(reference, riskSets, dateCompact, maxCandidates = 260) {
   // 注意/處置股不再剔除，改在 pick 上標示（前端可切換隱藏）。
   // 停牌/下市股則硬排除：掛單也不會成交，出現在清單只會誤導。
@@ -6704,6 +7457,7 @@ function preselectQuotes(reference, riskSets, dateCompact, maxCandidates = 260) 
     .filter((quote) => !riskSets?.halted?.has(quote.code) && !riskSets?.delisted?.has(quote.code))
     .filter((quote) => !dateCompact || toCompactDate(quote.asOf || quote.rawDate) === dateCompact)
     .filter((quote) => Number.isFinite(quote.price) && Number.isFinite(quote.previousClose))
+    .filter((quote) => (Number(quote.volumeLots) || 0) >= OVERNIGHT_MIN_VOLUME_LOTS)
     .map((quote) => {
       const changePct = pct(quote.price - quote.previousClose, quote.previousClose) || 0;
       const amplitudePct = pct((quote.high || quote.price) - (quote.low || quote.price), quote.previousClose) || 0;
@@ -6732,7 +7486,10 @@ function groupPicks(picks, maxPerGroup = 20) {
   return groups;
 }
 
-const OVERNIGHT_FORMULA_VERSION = "overnight-v1-aggressive-controlled";
+// v2：訊號判定改吃還原權息後的序列（D-02）。門檻一個都沒動，但除權息當天的漲跌幅與
+// 均線基準變了，會改變哪些股票入選，所以舊快照不可與新快照混進同一個分母。
+// v3：候選池加上絕對成交量下限 OVERNIGHT_MIN_VOLUME_LOTS（D-33）。
+const OVERNIGHT_FORMULA_VERSION = "overnight-v3-liquidity-floor";
 // 2026-07-13 前的快照尚未存 formulaVersion；當時只有這一版公式。
 // 這個常數刻意與 current 分開，未來升版時不可把缺欄位舊資料誤認成新版。
 const LEGACY_OVERNIGHT_FORMULA_VERSION = "overnight-v1-aggressive-controlled";
@@ -6763,6 +7520,14 @@ async function buildOvernightSignalsUncached({
   const candidates = preselectQuotes(reference, riskSets, latestDate, maxCandidates);
   const companyDirectory = await getCompanyDirectory();
   const issuedShares = companyDirectory.issuedShares;
+  // 卡片旁的「近 30 日回測」是歷史統計，必須跑在還原權息後的序列上，
+  // 否則除權息當天的機械性跳空會被算成真實跌幅，直接墊高 brokeMinus2Rate、壓低達成率。
+  const [, corporateActionCoverage] = await Promise.all([
+    loadFundamentalsHistory(),
+    // 下面 getStockHistory 開了 fallbackRange "1y"，補齊範圍要跟得上最遠可能退到的月份。
+    ensureCorporateActionResults(compactMonthsBefore(latestDate, CORPORATE_ACTION_RESULT_FALLBACK_MONTHS), latestDate),
+  ]);
+  const unresolvedToday = [];
   const enriched = await mapLimit(candidates, 3, async (quote) => {
     let history = await getStockHistory(quote, latestDate, 4, {
       allowExternalFallback: true,
@@ -6770,12 +7535,47 @@ async function buildOvernightSignalsUncached({
       fallbackRange: "1y",
     });
     history = appendTodayCloseBar(history, quote, latestDate);
-    const metrics = computeMetrics(history);
+    // 訊號判定與歷史統計都跑在還原權息後的序列上（D-02）。
+    // 沒還原時 computeMetrics 的「前一根收盤」是除權息**前**的價格，算出來的是一個機械性
+    // 跌幅而不是真實漲跌——同一天同一檔因此有兩個漲跌幅：候選池用交易所口徑的
+    // quote.previousClose（＝參考價），metrics 用前一根 close。還原後前一根 close 就是官方
+    // 參考價，兩個數字終於是同一件事。
+    // 今天那一根本身永遠不會被還原：factor 從 1 起算、事件當根在 factor 更新前就寫入，
+    // 所以卡片上的開高低收與成交量仍是真實成交數字（pinned in overnight-back-adjust.test）。
+    const officialActions = corporateActionHistoryForCode(quote.code, history[0]?.date, history.at(-1)?.date);
+    const adjustOptions = { allowHeuristicFallback: isOrdinaryStock(quote) };
+    const adjustments = resolveCorporateActionAdjustments(history, officialActions, adjustOptions);
+    // 交易所說「今天有事件」但比率算不出來 → 還原不會發生，changePct 就退回機械性跌幅，
+    // 而且畫面上毫無跡象。與波段掃描同一條規則：算不出來就不給結論，寧可少一檔。
+    // 實測 2026-07-24（260 檔／31,137 根 K）：unresolved 只佔 0.016%，落在訊號日的 0 檔。
+    if ((adjustments.unresolvedIndices || []).includes(history.length - 1)) {
+      unresolvedToday.push(quote.code);
+      return [];
+    }
+    const adjustedHistory = backAdjustForCorporateActions(history, officialActions, adjustOptions);
+    const metrics = computeMetrics(adjustedHistory);
     if (!metrics || toCompactDate(metrics.date) !== latestDate) return [];
     metrics.turnover = computeTurnoverPct(metrics.volumeLots, issuedShares.get(metrics.code) ?? NaN);
-    return evaluateGroups(metrics).map((groupInfo) =>
-      buildPick(metrics, groupInfo, null, summarizeRecentBacktest(history, groupInfo.group, 30))
-    );
+    // 訊號日本身就是事件日時，畫面上的漲跌幅是相對參考價算的，要說出來——
+    // 使用者對照券商 App 看到的是同一個口徑，但對照「昨天的收盤價」會兜不起來。
+    const todayAdjustment = adjustments.get(adjustedHistory.length - 1) || null;
+    const basisTag = !todayAdjustment ? "" :
+      String(todayAdjustment.source || "").startsWith("heuristic") ? "疑似公司行動・漲跌為估算" : "除權息日・漲跌對參考價";
+    // 量比的兩道門檻（強勢續攻 ≥1.5、爆量高危 ≥3）拿的是「今日量 ÷ 前 N 日均量」。配股／現增
+    // 會改變股數，事件前的量要按同一個倍數放大才可比；倍數推導不出來時沿用 1，均量偏低、
+    // 量比就**偏高**——失效方向是「不該出現的標的出現了」。官方那張表分不出配股與現增
+    // （見 D-29），所以只能標示不能修正；20 根是量比視窗的長度。
+    const volumeUnknown = (adjustments.shareFactorUnknownIndices || [])
+      .some((index) => index >= history.length - 20);
+    return evaluateGroups(metrics).map((groupInfo) => {
+      const pick = buildPick(metrics, groupInfo, null, summarizeRecentBacktest(adjustedHistory, groupInfo.group, 30));
+      if (basisTag) {
+        pick.riskTags = [...pick.riskTags, basisTag];
+        pick.corporateActionBasis = { source: todayAdjustment.source, referencePrice: metrics.previousClose };
+      }
+      if (volumeUnknown) pick.riskTags = [...pick.riskTags, "配股比率未公告・量比偏高"];
+      return pick;
+    });
   });
 
   const picks = enriched.flat();
@@ -6803,6 +7603,16 @@ async function buildOvernightSignalsUncached({
       ...riskSets.warnings,
       ...(laggingMarkets.length
         ? [`${laggingMarkets.join("、")}的收盤資料尚未更新到 ${compactToSlashDate(latestDate)}，這份清單暫時只涵蓋已更新的市場，稍晚會自動補齊。`]
+        : []),
+      // 訊號判定與卡片旁的「近 30 日回測」都跑在還原後的序列上（D-02）；來源沒抓齊時，
+      // 除權息當天的機械性跳空會被算成真實跌幅，回測百分比偏低、當天的訊號也可能整個跑掉。
+      ...(corporateActionCoverage?.degraded
+        ? ["官方除權除息計算結果表這一輪有部分月份沒抓到，除權息當天的漲跌幅與近 30 日回測數字可能失真；資料會在下一輪補齊。"]
+        : []),
+      // 「交易所說有事件、我們算不出比率」的股票被排除了，要說出來——否則使用者只會
+      // 發現某一檔今天莫名其妙不見了。
+      ...(unresolvedToday.length
+        ? [`${unresolvedToday.length} 檔今天有官方公司行動但參考價尚未取得（${unresolvedToday.slice(0, 5).join("、")}${unresolvedToday.length > 5 ? "…" : ""}），這些暫時不列入清單，公告補齊後會自動恢復。`]
         : []),
     ]),
     groups,
@@ -6940,29 +7750,12 @@ function parseTradingCalendarSource(key, rows) {
 }
 
 async function loadTradingCalendarSource(key) {
-  const state = tradingCalendarSourceCache[key];
   const source = TRADING_CALENDAR_SOURCES[key];
-  const now = Date.now();
-  if (state.value && state.expiresAt > now) return { status: "fresh", value: state.value, error: "" };
-  if (state.inFlight) return state.inFlight;
-  if (state.retryAt > now) return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-  state.inFlight = (async () => {
-    try {
-      const value = parseTradingCalendarSource(key, await fetchJson(source.url));
-      state.value = value;
-      state.expiresAt = Date.now() + source.ttlMs;
-      state.retryAt = 0;
-      state.lastError = "";
-      return { status: "fresh", value, error: "" };
-    } catch (error) {
-      state.lastError = String(error?.message || error || "未知錯誤");
-      state.retryAt = Date.now() + source.retryMs;
-      return { status: state.value ? "stale" : "unavailable", value: state.value, error: state.lastError };
-    }
-  })().finally(() => {
-    state.inFlight = null;
+  return loadWithLastGood(tradingCalendarSourceCache[key], {
+    ttlMs: source.ttlMs,
+    retryMs: source.retryMs,
+    load: async () => parseTradingCalendarSource(key, await fetchJson(source.url)),
   });
-  return state.inFlight;
 }
 
 async function getTradingCalendarEvidence() {
@@ -7088,7 +7881,11 @@ async function getOfficialObservationEvidence(quote, signalDate, observationDate
   if (quoteDate === observation && [quote.open, quote.high, quote.low, quote.price].every(Number.isFinite)) {
     return {
       status: "ok",
-      bar: { date: observation, open: quote.open, high: quote.high, low: quote.low, close: quote.price, current: quote.price },
+      bar: {
+        date: observation, open: quote.open, high: quote.high, low: quote.low, close: quote.price, current: quote.price,
+        // 交易所昨收：除權息／減資當天就是官方參考價，用來把訊號日基準價換算到同一尺度。
+        previousClose: quote.previousClose ?? null,
+      },
       nextDate: observation,
       source: "TWSE/TPEx official daily close",
       phase: "final",
@@ -7104,7 +7901,10 @@ async function getOfficialObservationEvidence(quote, signalDate, observationDate
     }
     return {
       status: "ok",
-      bar: { date: observation, open: exact.open, high: exact.high, low: exact.low, close: exact.close, current: exact.close },
+      bar: {
+        date: observation, open: exact.open, high: exact.high, low: exact.low, close: exact.close, current: exact.close,
+        previousClose: exact.previousClose ?? null,
+      },
       nextDate: observation,
       source: exact.source || "official monthly history",
       phase: "final",
@@ -7118,6 +7918,51 @@ async function getOfficialObservationEvidence(quote, signalDate, observationDate
       warning: `${quote.code} ${quote.name || ""} 的觀察日行情抓取失敗：${error.message}`.trim(),
     };
   }
+}
+
+// 觀察日若是除權息日，要用實測可靠的來源解出「事件後尺度的基準價」。
+// 偵測（歸檔 或 計算結果表有這一筆）與量化（比率／官方參考價）分開，判準與波段驗證一致。
+// 正常日子這裡不會多打任何請求：沒有候選就直接回空 Map。
+async function resolveObservationActionBases(picks, observationCompact, reference) {
+  const bases = new Map();
+  if (!observationCompact || !Array.isArray(picks) || !picks.length) return bases;
+  // 計算結果表既是量化來源、也是比歸檔更完整的偵測來源（歸檔只從部署後累積），所以先補齊當月。
+  // 一次請求涵蓋全市場，且有 24 小時／TTL 快取，成本可忽略。
+  await ensureCorporateActionResults(compactMonthsBefore(observationCompact, 1), observationCompact);
+  const candidates = unique(picks.map((pick) => pick.code).filter(Boolean)).filter((code) => (
+    corporateActionHistoryForCode(code, observationCompact, observationCompact).length > 0
+    || corporateActionResultFor(code, observationCompact) !== null
+  ));
+  if (!candidates.length) return bases;
+  await mapLimit(candidates, 4, async (code) => {
+    // ① 上市：交易所自己算的比率（實測過去 228 筆事件 228 筆都查得到）。
+    const ratio = corporateActionResultRatio(code, observationCompact);
+    if (ratio !== null) {
+      bases.set(code, { ratio, source: "exchange-result" });
+      return;
+    }
+    // ② 上櫃：沒有 TWT49U 對應端點，改查官方逐檔月歷史——那裡的漲跌欄是相對參考價算出來的
+    //    正常數字，close − change 就是官方參考價（實測 5/5）。**整批當日收盤不行**，
+    //    它的漲跌欄在事件日是中文字串 `"除息"`／`"除權"`。
+    const quote = reference?.byCode?.get(code);
+    if (!quote?.exchange) {
+      bases.set(code, { unresolved: true });
+      return;
+    }
+    try {
+      const rows = await fetchStockHistoryMonth(code, quote.exchange, observationCompact, quote.name);
+      const exact = rows.find((row) => toCompactDate(row.date) === observationCompact);
+      const exchangePreviousClose = Number(exact?.exchangePreviousClose);
+      if (Number.isFinite(exchangePreviousClose) && exchangePreviousClose > 0) {
+        bases.set(code, { base: exchangePreviousClose, source: "exchange-quote" });
+        return;
+      }
+    } catch {
+      // 抓取失敗與「抓到了但欄位被遮」都算解不出來——都不可以拿原始價當基準。
+    }
+    bases.set(code, { unresolved: true });
+  });
+  return bases;
 }
 
 async function observeSignalSnapshot(snapshot, { allowIntraday = false, reference = null, calendar = null } = {}) {
@@ -7209,14 +8054,44 @@ async function observeSignalSnapshot(snapshot, { allowIntraday = false, referenc
     evidenceByCode = await collectEvidence(observationCompact);
   }
 
+  // 下面判定除權息基準要查官方歸檔，先確保它已載入（未載入時 corporateActionHistoryForCode 只會回空陣列）。
+  await loadFundamentalsHistory();
+  const actionBaseByCode = await resolveObservationActionBases(picks, observationCompact, reference);
   const evidenceWarnings = [...evidenceByCode.values()].map((evidence) => evidence.warning).filter(Boolean);
   const rows = picks.map((pick) => {
     const evidence = evidenceByCode.get(pick.code);
-    const base = Number(pick.price);
+    const signalClose = Number(pick.price);
     const bar = evidence?.bar;
-    if (evidence?.status !== "ok" || !bar || !Number.isFinite(base) || base <= 0) {
+    if (evidence?.status !== "ok" || !bar || !Number.isFinite(signalClose) || signalClose <= 0) {
       return { ...pick, verified: false, pendingReason: evidence?.status || "missing" };
     }
+    // 觀察日若是除權息日，價格會機械性跳空，拿訊號日原始收盤當基準會直接記成大跌
+    //（配息 5% 就必然觸發 brokeMinus2）。基準價要換成事件後的同一尺度，報酬才是含息總報酬。
+    //
+    // **絕不可用 `bar.previousClose`**（2026-07-27 實測 20260724 的 18 筆真實事件）：
+    //   整批當日收盤／上市：`Change` 是 `"0.0000"` 哨兵（12/12）→ previousClose ＝ 當日收盤，
+    //     基準價會變成「觀察日自己的收盤」，currentReturn 恆為 0、高低報酬改成相對收盤衡量。
+    //   整批當日收盤／上櫃：`Change` 是**中文字串** `"除息"`／`"除權"`（6/6）→ parseNumber 回 null
+    //     → 換不了基準 → 退回訊號日收盤 → 假大跌（6435 配息 7.5 元／股價 270 → −2.7%，觸發 brokeMinus2）。
+    //   逐檔月歷史／上市：漲跌欄被遮成 `"X0.00"` → 同樣是 null → 假大跌。
+    // 四種組合裡只有「逐檔月歷史／上櫃」是對的，所以基準改由 resolveObservationActionBases
+    // 用兩個實測可靠的來源解（上市 TWT49U 228/228、上櫃逐檔月歷史 5/5）。
+    //
+    // 偵測仍然先行、且擴大為「歸檔 或 計算結果表有這一筆」——歸檔只從部署後累積，
+    // 而 TWT49U 涵蓋全部歷史（D-43 實測抓到台積電／鴻海／中華電等歸檔完全沒有的事件）。
+    // 偵測到卻解不出基準時**不給結論**：標 unverified 讓它留在 pending，
+    // 寧可少一筆樣本，也不要把假大跌灌進成績單（partial 不污染分母是既有設計）。
+    const action = actionBaseByCode.get(pick.code) || null;
+    if (action?.unresolved) {
+      return { ...pick, verified: false, pendingReason: "corporate-action-unresolved" };
+    }
+    // 結果表給的是比率（參考價 ÷ 除權息前收盤），乘在快照價上；快照價與官方收盤的正常差異
+    // 因此不會被吸進報酬裡。上櫃走逐檔月歷史時拿到的是絕對的官方參考價。
+    const base = action
+      ? (action.ratio != null ? signalClose * action.ratio : action.base)
+      : signalClose;
+    const corporateActionAdjusted = Boolean(action)
+      && Math.abs(base / signalClose - 1) > CORPORATE_ACTION_RATIO_TOLERANCE;
     const openReturn = pct((bar.open ?? NaN) - base, base);
     const highReturn = pct((bar.high ?? NaN) - base, base);
     const lowReturn = pct((bar.low ?? NaN) - base, base);
@@ -7234,6 +8109,9 @@ async function observeSignalSnapshot(snapshot, { allowIntraday = false, referenc
       brokeMinus2: lowReturn !== null && lowReturn <= -2,
       observationSource: evidence.source,
       observationPhase: evidence.phase || "final",
+      ...(corporateActionAdjusted
+        ? { corporateActionAdjusted: true, adjustedBase: roundTo(base), signalClose: roundTo(signalClose) }
+        : {}),
     };
   });
   const verifiedRows = rows.filter((row) => row.verified);
@@ -7364,6 +8242,7 @@ async function buildVerificationHistory() {
     notes: [
       "觀察日依證交所實際交易日／開休市表判定，且只接受日期完全相等的官方 OHLC。",
       "基準＝訊號日收盤；達 +2% 看觀察日最高，破 -2% 看觀察日最低。partial 不納入長期正式統計。",
+      `所有百分比預設為未扣費稅的毛報酬；${VERIFY_COST_NOTE}`,
     ],
   };
   const hasPending = records.some((record) => !record.complete);
@@ -7412,7 +8291,24 @@ async function buildSignalVerification() {
     brokeMinus2: items.filter((row) => row.brokeMinus2).length,
     avgCurrentReturn: average(items.map((row) => row.currentReturn)),
     avgHighReturn: average(items.map((row) => row.highReturn)),
+    // 毛報酬保留原值不動；並陳扣掉來回費稅的估算淨值（見 VERIFY_COST_NOTE）。
+    // 隔日沖平均報酬本來就在 ±0.5% 這個量級，0.471% 的成本足以讓正負號翻轉。
+    avgCurrentReturnNet: netReturnPct(average(items.map((row) => row.currentReturn))),
+    avgHighReturnNet: netReturnPct(average(items.map((row) => row.highReturn))),
   });
+  // 三個分群是平行判定、沒有 else：strongContinuation 的條件是 pullbackReversal 的超集，
+  // 所以溫和上漲的紅 K 必定同時進兩群，同一檔會出現兩筆、貢獻完全相同的漲跌結果。
+  // 分群統計（summaryByGroup）以 pick 為單位是對的，但整體 summary 的分母必須以「檔」為單位
+  // 去重，否則樣本數虛胖、變異數被人為壓低。同檔取分數最高的那筆代表。
+  const dedupeByCode = (items) => {
+    const best = new Map();
+    for (const row of items) {
+      const current = best.get(row.code);
+      if (!current || (Number(row.score) || 0) > (Number(current.score) || 0)) best.set(row.code, row);
+    }
+    return [...best.values()];
+  };
+  const uniqueVerifiedRows = dedupeByCode(verifiedRows);
   const groups = {};
   for (const row of verifiedRows) {
     groups[row.group] ||= { groupName: row.groupName, rows: [] };
@@ -7425,13 +8321,16 @@ async function buildSignalVerification() {
   return {
     ok: true,
     ...observed,
-    summary: summarize(verifiedRows),
+    summary: summarize(uniqueVerifiedRows),
+    uniqueSignals: uniqueVerifiedRows.length,
+    duplicatedSignals: verifiedRows.length - uniqueVerifiedRows.length,
     summaryByGroup,
     rows: verifiedRows.sort((a, b) => (b.currentReturn ?? -999) - (a.currentReturn ?? -999)),
     unverified: unverifiedRows.map((row) => ({ code: row.code, name: row.name, group: row.group, groupName: row.groupName })),
     notes: [
       "觀察日依證交所實際交易日／開休市表判定，且每檔行情日期必須完全等於該日；不會把重新開啟 App 的日期當成隔日。",
       "報酬以訊號日收盤價為基準；達 +2% 用觀察日最高價判定，破 -2% 用觀察日最低價判定。",
+      `所有百分比預設為未扣費稅的毛報酬；${VERIFY_COST_NOTE}`,
     ],
   };
 }
@@ -7440,10 +8339,19 @@ function nextDayPerformance(history, signalIndex) {
   const signal = history[signalIndex];
   const next = history[signalIndex + 1];
   if (!signal || !next || !signal.close) return null;
-  const openReturn = pct(next.open - signal.close, signal.close);
-  const highReturn = pct(next.high - signal.close, signal.close);
-  const closeReturn = pct(next.close - signal.close, signal.close);
-  const lowReturn = pct(next.low - signal.close, signal.close);
+  // 隔日若是除權息／減資日，價格會機械性跳空，拿訊號日收盤當基準會憑空記出大跌。
+  // 交易所自己的昨收在事件日就是官方參考價，而且與 signal.close 來自同一份逐檔歷史、
+  // 是相鄰兩根，比較基礎一致（不像跨來源比對會誤判）。缺值時退回原行為。
+  const officialPreviousClose = Number(next.previousClose);
+  const base = Number.isFinite(officialPreviousClose)
+    && officialPreviousClose > 0
+    && Math.abs(officialPreviousClose / signal.close - 1) > CORPORATE_ACTION_RATIO_TOLERANCE
+    ? officialPreviousClose
+    : signal.close;
+  const openReturn = pct(next.open - base, base);
+  const highReturn = pct(next.high - base, base);
+  const closeReturn = pct(next.close - base, base);
+  const lowReturn = pct(next.low - base, base);
   return {
     date: next.date,
     openReturn,
@@ -7462,10 +8370,24 @@ async function buildBacktestUncached({ days = 30 } = {}) {
   const reference = await getReferenceData();
   const records = [];
 
+  // D-01：回測是第三條獨立路徑，掃描與前向驗證都已還原權息，只有它還在用原始價。
+  // 除權息日的機械性跳空會被算成真實跌幅，直接灌進「隔日開盤平均報酬」這種結論數字。
+  // 實測（2026-07-26）候選池裡半數以上的股票 6 個月內都有除權息，這不是邊緣案例。
+  const asOfCompact = toCompactDate(overnight.asOf);
+  await Promise.all([
+    loadFundamentalsHistory(),
+    ensureCorporateActionResults(compactMonthsBefore(asOfCompact, 5), asOfCompact),
+  ]);
+
   await mapLimit(codes, 6, async (code) => {
     const quote = reference.byCode.get(code);
     if (!quote) return;
-    const history = await getStockHistory(quote, toCompactDate(overnight.asOf), 4);
+    const rawHistory = await getStockHistory(quote, asOfCompact, 4);
+    // 跳空 heuristic 的前提是 ±10% 漲跌幅限制，只對普通股成立。
+    const officialActions = corporateActionHistoryForCode(code, rawHistory[0]?.date, rawHistory.at(-1)?.date);
+    const history = backAdjustForCorporateActions(rawHistory, officialActions, {
+      allowHeuristicFallback: isOrdinaryStock(quote),
+    });
     const startIndex = Math.max(20, history.length - days - 1);
     for (let index = startIndex; index < history.length - 1; index += 1) {
       const metrics = computeMetrics(history.slice(0, index + 1));
@@ -7486,6 +8408,10 @@ async function buildBacktestUncached({ days = 30 } = {}) {
       avgOpenReturn: average(perf.map((item) => item.openReturn)),
       avgHighReturn: average(perf.map((item) => item.highReturn)),
       avgCloseReturn: average(perf.map((item) => item.closeReturn)),
+      // 毛報酬保留原值；並陳扣掉來回費稅的估算淨值（見 VERIFY_COST_NOTE）。
+      avgOpenReturnNet: netReturnPct(average(perf.map((item) => item.openReturn))),
+      avgHighReturnNet: netReturnPct(average(perf.map((item) => item.highReturn))),
+      avgCloseReturnNet: netReturnPct(average(perf.map((item) => item.closeReturn))),
       hitPlus2Rate: perf.length ? perf.filter((item) => item.hitPlus2).length / perf.length : null,
       brokeMinus2Rate: perf.length ? perf.filter((item) => item.brokeMinus2).length / perf.length : null,
     };
@@ -7509,6 +8435,8 @@ async function buildBacktestUncached({ days = 30 } = {}) {
     notes: [
       "Backtest v1 runs on current signal candidates to keep official endpoint usage practical.",
       "Returns use signal-day close as the observation baseline and next trading day OHLC.",
+      "歷史序列已還原權息：除權息日的機械性跳空不是真實跌幅，不還原會直接灌進下方的平均報酬。",
+      `所有百分比預設為未扣費稅的毛報酬；${VERIFY_COST_NOTE}`,
     ],
   };
 }
@@ -7611,16 +8539,28 @@ function movingAverageSeries(rows, field, windowSize) {
   });
 }
 
+// emaSeries 直接把第一個值當 seed，沒有「期數未滿」保護，所以 MACD 從第 0 根就會吐數字，
+// 而那個數字被 seed 主導、不是真的動能。movingAverageSeries 本來就有這道保護（放大圖前幾根
+// MA 顯示 "--" 就是它），MACD 卻沒有。技術分析頁月 K 只抓 24 個月，seed 在第 24 根權重仍有
+// 6.66%——不是邊緣個股偶發，是月 K 常態；實測 18 根月 K、後 17 根零波動時 dif 仍高達 +6.05
+// （相當於股價 6% 的憑空動能），buildTechnicalSignals 會據此吐「MACD 負轉正」給使用者。
+// 遮罩規則：dif 要等慢線滿期（index >= slow-1）；dea 是 dif 再取一次 EMA，
+// 所以要再等 signal-1 根（index >= slow+signal-2）。兩個消費端都已用 Number.isFinite 守著，
+// 資料不足時訊號不觸發即可，不會讓整頁失敗。
 function computeMacd(rows, fast = 8, slow = 17, signal = 9) {
   const closes = rows.map((row) => row.close);
   const fastEma = emaSeries(closes, fast);
   const slowEma = emaSeries(closes, slow);
+  const difWarmupIndex = Math.max(fast, slow) - 1;
+  const deaWarmupIndex = difWarmupIndex + signal - 1;
   const dif = closes.map((_, index) => {
+    if (index < difWarmupIndex) return null;
     const fastValue = fastEma[index];
     const slowValue = slowEma[index];
     return Number.isFinite(fastValue) && Number.isFinite(slowValue) ? fastValue - slowValue : null;
   });
-  const dea = emaSeries(dif, signal);
+  const deaRaw = emaSeries(dif, signal);
+  const dea = deaRaw.map((value, index) => (index < deaWarmupIndex ? null : value));
   return rows.map((row, index) => ({
     date: row.date,
     dif: dif[index],
@@ -7747,6 +8687,13 @@ function buildTechnicalSignals(rows, macd, maShort, maMid, swings, supportLine, 
   return {
     breakout,
     breakdown,
+    // 「站在線的哪一側」是**狀態**，「今天剛穿過」是**事件**（breakout/breakdown 要求前一根還在線的另一側）。
+    // 舊寫法只回事件，於是價格早就站上壓力線之後，畫面同時顯示「壓力 3669.71」與
+    // 「目前沒有明確突破或跌破」——使用者看到收盤 3750 高於壓力 3670 卻被告知沒突破。
+    // 邏輯沒錯（那次突破不是今天），但那句話把「不是今天」講成了「沒有」。
+    // 實例：2454 聯發科 2026-07-24（收 3750／壓力線 3669.71）。
+    aboveResistance: Number.isFinite(resistanceNow) && last.close > resistanceNow,
+    belowSupport: Number.isFinite(supportNow) && last.close < supportNow,
     longWatch,
     risks,
     signals,
@@ -7766,7 +8713,9 @@ function buildTechnicalSignals(rows, macd, maShort, maMid, swings, supportLine, 
 
 async function buildTechnicalAnalysis({ code, period = "day" } = {}) {
   const clean = cleanCode(code);
-  if (!/^\d{4,6}$/.test(clean)) {
+  // 用全站共用的 4～6 碼英數規則：純數字 regex 會把 00631L／00632R 這類槓反 ETF 擋在門外，
+  // 但前端 isValidSecurityCode、/api/symbols 與自選股都認得它們，使用者會看到「請輸入有效的台股代號」。
+  if (!SECURITY_CODE_PATTERN.test(clean)) {
     return { ok: false, generatedAt: new Date().toISOString(), error: "請輸入有效的台股代號" };
   }
   const analysisPeriod = normalizeAnalysisPeriod(period);
@@ -7794,33 +8743,67 @@ async function buildTechnicalAnalysis({ code, period = "day" } = {}) {
   // 用「今天」當歷史資料上限，而不是整批收盤參考資料的日期：
   // STOCK_DAY_ALL 更新比個股月歷史慢，照它過濾會把今天已公布的收盤 K 砍掉。
   const dateCompact = toTaipeiCompactDate();
+  // 本機公司行動歸檔（還原權息的依據）要先載入，否則第一次開技術頁會拿到空 archive。
+  await loadFundamentalsHistory();
+  // 跳空 heuristic 的前提是「台股有 ±10% 漲跌幅限制」，只對普通股成立。
+  // 技術頁跟波段健檢不同，它本來就接受 ETF／權證代號（00631L 這類槓反 ETF 無漲跌幅限制），
+  // 對它們套跳空猜測會把一天的真實大漲追認成除權息，事件前的歷史全被乘上假比率。
+  const allowHeuristicFallback = isOrdinaryStock(quote);
+  const prepareRows = (dailyHistory) => buildAdjustedPeriodRows(
+    dailyHistory,
+    corporateActionHistoryForCode(clean, dailyHistory[0]?.date, dailyHistory.at(-1)?.date),
+    { period: analysisPeriod, allowHeuristicFallback },
+  );
   let rawHistory = await getStockHistory(quote, dateCompact, 24, {
     allowExternalFallback: true,
     fallbackMinRows: 60,
     fallbackRange: "2y",
   });
+  // 官方除權除息計算結果表：resolveCorporateActionAdjustments 是同步的，所以要先把
+  // 這段期間的月份補齊，它才查得到。抓過的月份會落盤，之後只會多抓當月。
+  let resultCoverage = await ensureCorporateActionResults(rawHistory[0]?.date, rawHistory.at(-1)?.date);
   let historySource = rawHistory.some((row) => row.source === "Yahoo Finance chart fallback")
     ? "Yahoo Finance chart fallback (official history unavailable)"
     : "TWSE/TPEx official history";
-  let aggregated = addPreviousClose(aggregateHistoryByPeriod(rawHistory, analysisPeriod))
-    .filter((row) => [row.open, row.high, row.low, row.close].every(Number.isFinite));
-  let rows = aggregated.slice(-180);
+  let prepared = prepareRows(rawHistory);
+  let rows = prepared.rows;
   const minBars = analysisPeriod === "month" ? 18 : 30;
   if (rows.length < minBars && !rawHistory.some((row) => row.source === "Yahoo Finance chart fallback")) {
     try {
       const fallbackHistory = await fetchYahooHistory(quote, dateCompact, analysisPeriod === "month" ? "5y" : "2y");
-      const fallbackRows = addPreviousClose(aggregateHistoryByPeriod(fallbackHistory, analysisPeriod))
-        .filter((row) => [row.open, row.high, row.low, row.close].every(Number.isFinite))
-        .slice(-180);
-      if (fallbackRows.length > rows.length) {
+      // 這一份比上面那次抓的長很多（月K 退到 5 年），加長的那段月份從來沒被補齊過，
+      // 而 prepareRows → resolveCorporateActionAdjustments 是**同步查表**，
+      // 所以不先 ensure 就等於那幾十個月一律查不到官方參考價、完全不還原，
+      // 而 resultCoverage 還停在第一次的範圍上（degraded 是 false），揭露不會觸發。
+      const extendedCoverage = await ensureCorporateActionResults(fallbackHistory[0]?.date, fallbackHistory.at(-1)?.date);
+      const fallbackPrepared = prepareRows(fallbackHistory);
+      if (fallbackPrepared.rows.length > rows.length) {
         rawHistory = fallbackHistory;
         historySource = "Yahoo Finance chart fallback (official history unavailable)";
-        aggregated = fallbackRows;
-        rows = fallbackRows;
+        prepared = fallbackPrepared;
+        rows = fallbackPrepared.rows;
+        resultCoverage = extendedCoverage;
       }
     } catch {
       // Keep the official rows and return the normal insufficient-data message below.
     }
+  }
+  const corporateActions = prepared.corporateActions;
+  // 「Yahoo 的原始 OHLC 是否已自行還原過配股」在這個專案裡從未實測（見 DOMAIN-BACKLOG D-42）。
+  // 掃描端早就對兩種來源一視同仁，技術頁跟進不是新的風險類別；但既然這頁現在顯示的是還原後的
+  // 價格，就得讓使用者知道這段數字疊了兩層未經核對的處理，不能默默端出去。
+  if (corporateActions.adjusted && historySource.startsWith("Yahoo")) {
+    corporateActions.notes.push("這段歷史來自 Yahoo 備援序列，它的原始價已自行把配股當分割還原過，"
+      + "本頁只補回現金股利那一段；換算不出配股倍數的事件會直接標為未定案。");
+    corporateActions.alert = true;
+  }
+  if (resultCoverage.degraded) {
+    // 「抓不到」與「超出補齊範圍」是兩件事：後者在月K 退到 5 年時是必然的（上限 30 個月），
+    // 講成「暫時抓不到」會讓使用者以為等一下重整就好。
+    corporateActions.notes.push(resultCoverage.truncated
+      ? `這張圖最舊的 ${resultCoverage.truncated} 個月超出官方除權除息計算結果表的補齊範圍，那一段改用公告公式或跳空估算還原。`
+      : "官方除權除息計算結果表有部分月份暫時抓不到，這段期間改用公告公式或跳空估算還原。");
+    corporateActions.alert = true;
   }
   if (rows.length < minBars) {
     const periodLabel = analysisPeriod === "month" ? "月K" : analysisPeriod === "week" ? "週K" : "日K";
@@ -7838,6 +8821,7 @@ async function buildTechnicalAnalysis({ code, period = "day" } = {}) {
       availableBars: rows.length,
       error: `官方${periodLabel}歷史資料不足：目前只抓到 ${rows.length} 根，至少需要 ${minBars} 根。${suggestion}`,
       candles: rows,
+      corporateActions,
       warnings: reference.warnings || [],
     };
   }
@@ -7847,7 +8831,34 @@ async function buildTechnicalAnalysis({ code, period = "day" } = {}) {
   const swings = findSwingPoints(rows, 2);
   const supportLine = buildTrendLine(swings.lows, "support", rows.length - 1);
   const resistanceLine = buildTrendLine(swings.highs, "resistance", rows.length - 1);
-  const signals = buildTechnicalSignals(rows, macd, maShort, maMid, swings, supportLine, resistanceLine);
+  // 官方已公告當天有公司行動、但公式欄位還不齊 → 事件之前的 K 只能估算或根本沒還原。
+  // 依 stock1-domain：圖形可以先估算著看，但不得提供單檔型態結論。
+  // 這裡把突破／跌破／做多觀察整組停掉並標 suppressed，前端才不會把「沒評估」畫成「沒滿足條件」。
+  const conclusionsSuppressed = corporateActions.unresolvedDates.length > 0;
+  const signals = conclusionsSuppressed
+    ? {
+      breakout: false,
+      breakdown: false,
+      // suppressed 時連「站在線的哪一側」都不能講：那條線畫在沒有正確還原的價格上。
+      aboveResistance: false,
+      belowSupport: false,
+      longWatch: false,
+      suppressed: "corporate-action-unresolved",
+      risks: [],
+      signals: [],
+      checks: {
+        closeAboveResistance: false,
+        macdOk: false,
+        volumeAbove20: false,
+        aboveMovingAverages: false,
+        histogramTurnPositive: false,
+        histogramExpanding: false,
+        histogramShrinking: false,
+        brokePreviousSwingLow: false,
+        longBlackVolume: false,
+      },
+    }
+    : buildTechnicalSignals(rows, macd, maShort, maMid, swings, supportLine, resistanceLine);
   const fibonacci = buildFibonacci(rows, swings, signals.breakout);
   const candles = rows.map((row, index) => ({
     date: row.date,
@@ -7899,6 +8910,9 @@ async function buildTechnicalAnalysis({ code, period = "day" } = {}) {
       swingWindow: 2,
     },
     asOf: rows.at(-1).date,
+    // 還原權息揭露：技術頁與波段健檢從此跑在同一組還原後的價格上，
+    // 兩頁不會再對同一檔同一天給出相反的型態結論（除息造成的假跌破／假死叉）。
+    corporateActions,
     candles,
     swingHighs: swings.highs.slice(-12),
     swingLows: swings.lows.slice(-12),
@@ -7959,6 +8973,14 @@ function averageTrueRange(rows, period = 14) {
 // 還原股價優先使用官方除權息公告；只有呼叫端沒有官方證據時，才以 >10.5% 異常跳空降級估算。
 // 大跌／大漲也可能形成跳空，因此 heuristic 只能標「疑似」，絕不能宣稱一定是除息。
 // 錨定最新棒（factor 從最後一根的 1 往回累乘）：最近的價格不動，只調整事件以前的歷史。
+// 10.5% 跳空 heuristic 的前提是「這兩根是相鄰交易日」。逐月歷史抓取失敗會被
+// `.catch(() => [])` 吞成空陣列，`flat().sort()` 直接把缺月前後接起來，於是跨月的正常漲跌
+// 會被誤判成公司行動：缺口以前所有價格被乘上假比率，MA60／布林／MACD 一起錯，
+// 前端還會顯示「近期疑似權息跳空(估算還原)」這個不存在的事件。而且誤觸發後 source 只會是
+// heuristic、不進 unresolvedIndices，scanSwingBoard 的攔截也擋不到。
+// 門檻取 14 天：一般週末是 3 天、農曆春節連假約 5～10 天，而缺一整月是 28～31 天，區隔充分。
+// 官方事件有明確 exDate 可比對，不受影響；只有 heuristic 需要這道相鄰性檢查。
+const HEURISTIC_MAX_GAP_DAYS = 14;
 function corporateActionGapRatio(row, previousClose, thresholdPct = 10.5) {
   if (!row || !Number.isFinite(previousClose) || previousClose <= 0) return null;
   const open = Number(row.open);
@@ -7974,6 +8996,27 @@ function corporateActionGapRatio(row, previousClose, thresholdPct = 10.5) {
 // 證交所／櫃買中心公告公式：
 // 除權息參考價＝[(前收－息值)＋(現增認購價×現增配股率)]／(1＋無償配股率＋現增配股率)。
 // 回傳「參考價／前收」作為事件前所有價格的回溯調整因子。
+const CORPORATE_ACTION_MAX_PLAUSIBLE_RATIO = 1;
+
+// 量級檢查要由價格公式與股數倍數**共用**，否則同一筆事件會被兩條路判出相反的結論。
+// 舊寫法只把上限寫在 officialCorporateActionRatio 裡，於是：
+//   (a) 上游若把比率改成「每仟股股數」（帳本那側 2026 年就有同名防呆，見「無償配股率大於 1」），
+//       價格那條被擋下標未定案，但 1＋stockRatio＋subscriptionRatio 仍算出 101，
+//       直接餵給 Yahoo 座標系換算（ratio × 101）與成交量還原因子；
+//   (b) 反過來，真正合法的 >100% 無償配股會被價格那條擋成未定案，股數倍數卻照樣給出 2.x。
+// 回 null＝「這筆的股數倍數不可信」，呼叫端一律當成推導不出來處理。
+function plausibleShareFactor(action) {
+  if (!action) return null;
+  const clamp = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : 0;
+  };
+  const stockRatio = clamp(action.stockRatio);
+  const subscriptionRatio = clamp(action.subscriptionRatio);
+  if (stockRatio > CORPORATE_ACTION_MAX_PLAUSIBLE_RATIO || subscriptionRatio > CORPORATE_ACTION_MAX_PLAUSIBLE_RATIO) return null;
+  return 1 + stockRatio + subscriptionRatio;
+}
+
 function officialCorporateActionRatio(action, previousClose) {
   if (!action || !Number.isFinite(previousClose) || previousClose <= 0) return null;
   if (action.formulaComplete === false || action.status === "withdrawn") return null;
@@ -7991,16 +9034,52 @@ function officialCorporateActionRatio(action, previousClose) {
   // 舊 archive 沒保存現增欄位；不論權或息都不能把「未知」擅自當 0。
   if (!hasSubscriptionSchema) return null;
   if (kind.includes("息") && cashRaw === null) return null;
+  // 除權至少要有一個明確的比率欄位。這裡刻意是 AND 不是 OR——
+  // 官方對「沒有現增」的表達方式就是把現增欄位留空，而「配股但不配現增」是除權息的常態
+  // （2026-07 實測歸檔：59 筆除權事件裡有 31 筆是 stockRatio 有值、subscriptionRatio 為 null）。
+  // 要求兩欄都有值等於把過半配股公司判成「公式不齊」，波段健檢打不開、掃描也把它們剔除。
+  // 至於原本擔心的「缺漏欄位被當成 0 → ratio 算出 1，一根價都不調卻蓋上 official 章」，
+  // 由下方的「兩個比率都是 0 的除權在定義上不成立」防呆負責，這裡不需要重複把關。
   if (kind.includes("權") && stockRaw === null && subscriptionRaw === null) return null;
   const cashDividend = cashRaw || 0;
   const stockRatio = stockRaw || 0;
   const subscriptionRatio = subscriptionRaw || 0;
+  // 量級防呆。官方欄位名叫 Ratio，但同一份報表的網頁版是以「每仟股無償配股（股）」呈現。
+  // 2026-07-26 實測確認 OpenAPI 回的是比率（0.09999999＝配股 10%），但上游哪天改版成每仟股股數，
+  // 除數就會從 1.1 變成 101，整段 K 線塌陷卻仍蓋著 official 章、不走 heuristic、也沒有任何告警。
+  // 單次無償配股／現增比率超過 1（＝配股超過 100%）本來就極罕見，一律當資料異常擋下來標未定案，
+  // 寧可讓人去查，也不要無聲算出一條塌掉的均線。
+  if (stockRatio > CORPORATE_ACTION_MAX_PLAUSIBLE_RATIO || subscriptionRatio > CORPORATE_ACTION_MAX_PLAUSIBLE_RATIO) return null;
   // 現增比率存在但認購價尚未公告時不能假裝精確；留給呼叫端日後資料修訂後再算。
   if (subscriptionRatio > 0 && subscriptionPrice === null) return null;
   const referencePrice = (
     previousClose - cashDividend + (subscriptionPrice || 0) * subscriptionRatio
   ) / (1 + stockRatio + subscriptionRatio);
+  // 除權事件算出「完全不用調整」是可疑值（兩個比率都 0 的除權在定義上不成立）→ 當成資料不完整。
+  if (kind.includes("權") && stockRatio === 0 && subscriptionRatio === 0) return null;
   const ratio = referencePrice / previousClose;
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : null;
+}
+
+// 來源可信度分級（高到低）。前兩級都是交易所自己算出來的參考價，比我們套公式更可信：
+//   exchange-result 上市 TWT49U 計算結果表：直接給前收盤價與參考價，已套過升降單位。
+//   exchange-quote  上櫃逐檔歷史：漲跌價差是相對參考價算的 → close − change 就是參考價。
+//   official        本機歸檔的除權息預告 ＋ 官方公式。
+//   heuristic*      >10.5% 跳空推測，只對有漲跌幅限制的普通股成立，一律標「疑似」。
+const EXCHANGE_CORPORATE_ACTION_SOURCES = new Set(["exchange-result", "exchange-quote"]);
+function isOfficialCorporateActionSource(source) {
+  return source === "official" || EXCHANGE_CORPORATE_ACTION_SOURCES.has(source);
+}
+
+// Yahoo 備援序列的還原語意跟官方逐檔歷史不同（2026-07-26 實測 4 檔配股個股全部吻合）：
+// Yahoo 的 indicators.quote 已經把台股「配股」當成分割自行還原了（30% 配股＝1300:1000），
+// 但「現金股利」沒有還原（純現金的對照組 2002 中鋼與官方收盤完全相等）。
+// 所以在 Yahoo 的座標系裡，正確的回溯因子是「官方因子 × 配股倍數」——
+// 把官方因子裡已經被 Yahoo 做掉的那一段乘回去，否則配股會被還原兩次、事件前的價格被壓低。
+function yahooSpaceRatio(rawRatio, shareFactor) {
+  if (!Number.isFinite(rawRatio) || rawRatio <= 0) return null;
+  if (!Number.isFinite(shareFactor) || shareFactor <= 0) return null;
+  const ratio = rawRatio * shareFactor;
   return Number.isFinite(ratio) && ratio > 0 ? ratio : null;
 }
 
@@ -8013,34 +9092,162 @@ function resolveCorporateActionAdjustments(rows, officialActions, { allowHeurist
       if (exDate) actionsByDate.set(exDate, action);
     }
   }
-  const adjustments = new Map(); // row index → { ratio, source }
+  const adjustments = new Map(); // row index → { ratio, source, shareFactor }
   const unresolvedIndices = [];
+  const historyGapIndices = [];
+  const shareFactorUnknownIndices = [];
   for (let index = 1; index < rows.length; index += 1) {
-    const rowDate = toCompactDate(rows[index]?.date);
+    const row = rows[index];
+    const previousRow = rows[index - 1];
+    const rowDate = toCompactDate(row?.date);
+    const previousDate = toCompactDate(previousRow?.date);
+    const gapDays = rowDate && previousDate ? compactDaysDiff(previousDate, rowDate) : null;
+    const contiguous = gapDays !== null && gapDays >= 1 && gapDays <= HEURISTIC_MAX_GAP_DAYS;
+    if (!contiguous) historyGapIndices.push(index);
+    const priorClose = Number(previousRow?.close);
     const officialAction = rowDate ? actionsByDate.get(rowDate) : null;
-    let ratio = officialAction ? officialCorporateActionRatio(officialAction, rows[index - 1]?.close) : null;
-    // 同日既然已有官方公司行動，公式欄位不完整就不能用跳空猜測把它「洗白」成可交易資料。
-    // heuristic 仍可暫時還原圖形，但 unresolved 必須一路傳到 scan／inspect，直到公告補齊後再重算。
-    const officialUnresolved = Boolean(officialAction && ratio === null);
-    let source = ratio !== null ? "official" : "";
-    if (ratio === null && (!officialAvailable || allowHeuristicFallback)) {
-      ratio = corporateActionGapRatio(rows[index], rows[index - 1]?.close);
-      source = ratio !== null ? (officialAction ? "heuristic-incomplete-official" : "heuristic") : "";
+    // Yahoo 備援序列不能沿用官方逐檔歷史的語意（見 yahooSpaceRatio）。
+    // **兩個問法不一樣，不可共用一個旗標**：
+    //   fromYahoo（事件日那一列）→ 決定「這一列自己的欄位可不可信」，例如 exchangePreviousClose。
+    //   priorFromYahoo（前一列）→ 決定「即將被乘上因子的那些列在哪個座標系」，因子只作用在
+    //     index 之前的列，所以座標系要問前一列。
+    // 混用會在接縫上取反：三個入口都是 getStockHistory(allowExternalFallback) → appendTodayCloseBar，
+    // 官方逐檔被限流時會產生「一整串 Yahoo 列 ＋ 一根官方當日 K」；事件正好落在那根時
+    // fromYahoo 是 false，rawSpace 的換算被整組跳過。實測（6944，Yahoo 已套 1.3 分割）：
+    // 事件前收盤被壓成 599.41 而不是 779.23——整段歷史低 23%，而且 unresolvedIndices 是空的、
+    // source 還蓋著 exchange-result 官方章，掃描端與健檢端都不會攔。
+    const fromYahoo = String(row?.source || "").startsWith("Yahoo");
+    const priorFromYahoo = String(previousRow?.source || "").startsWith("Yahoo");
+
+    // 無償配股／現增會同時改變股數，成交量要按這個倍數反向調整。
+    // 走與價格公式同一道量級檢查（plausibleShareFactor）：比率明顯不像比率時回 null，
+    // 讓下游當成「推導不出來」，而不是拿一個 101 倍去乘成交量或 Yahoo 換算倍數。
+    const archiveShareFactor = plausibleShareFactor(officialAction);
+
+    // Yahoo 的價格座標系跟官方逐檔歷史差了一個配股倍數（它已自行把配股當分割還原）。
+    // 官方來源（計算結果表、公告公式）算出來的因子是「原始座標系」的，必須換算；
+    // 由 Yahoo 自身資料推出來的跳空 heuristic 本來就在 Yahoo 座標系，換算會變成錯上加錯。
+    const resultKind = rowDate && row?.code ? String(corporateActionResultFor(row.code, rowDate)?.kind || "") : "";
+    // 換算倍數的三個來源，依可信度排序：
+    //   1. Yahoo 自己回報的分割倍數——我們要的正是「Yahoo 實際套了多少」，這是定義上的答案。
+    //   2. 本機歸檔公告的 1＋配股率＋現增率——真實比率，通常等於 Yahoo 套的，但歸檔覆蓋率有限。
+    //   3. 官方計算結果表的 kind：純除息代表沒有配股，倍數必為 1。
+    // 三者都拿不到就回 null，寧可不調也不要把配股還原兩次。
+    // 問的是「前一列（會被乘上因子的那些）在哪個座標系」，所以用 priorFromYahoo；
+    // 但分割倍數本身要讀事件日那一列——Yahoo 是在事件當天套上分割的。
+    const rowSplitFactor = Number(row?.yahooSplitFactor);
+    // 結果表的順位高於歸檔：它說這天有配股（kind 含「權」）而歸檔卻推出「股數沒變」（倍數 1），
+    // 代表歸檔缺了配股欄位，不是真的沒配股——這種矛盾一律當推導不出來，別拿 1 去換算。
+    const archiveContradictsResult = resultKind.includes("權") && archiveShareFactor === 1;
+    const yahooShareFactor = !priorFromYahoo
+      ? 1
+      : (Number.isFinite(rowSplitFactor) && rowSplitFactor > 0 ? rowSplitFactor : null)
+        ?? (archiveContradictsResult ? null : archiveShareFactor)
+        ?? ((resultKind && !resultKind.includes("權")) ? 1 : null);
+    // 官方公式要用「原始座標系的前收」去算，否則現金股利會被拿去跟已經除過配股的價格相減。
+    const rawPriorClose = Number.isFinite(yahooShareFactor) && yahooShareFactor > 0
+      ? priorClose * yahooShareFactor
+      : priorClose;
+
+    // ---- 第一順位：交易所自己算的參考價 ----
+    let ratio = null;
+    let source = "";
+    let rawSpace = false; // 這個因子是不是「原始座標系」的（Yahoo 需要換算）
+    const resultRatio = rowDate && row?.code ? corporateActionResultRatio(row.code, rowDate) : null;
+    if (resultRatio !== null) {
+      // TWT49U 給的前收盤價本身就是原始價，所以這個比值一定是原始座標系。
+      ratio = resultRatio;
+      source = "exchange-result";
+      rawSpace = true;
+    } else if (Number.isFinite(priorClose) && priorClose > 0) {
+      // 上櫃：exchangePreviousClose 在事件日就是官方參考價，與前一列實際收盤不符即為事件。
+      // 用與波段驗證同一套 0.2% 容忍度，避免把升降單位造成的捨入誤差當成公司行動。
+      // 必須要求相鄰：逐月歷史抓取失敗會被吞成空陣列，缺月前後直接接起來之後，
+      // 「交易所昨收」講的是真正的前一個交易日、priorClose 卻是幾週前那根，
+      // 兩者本來就對不上，沒有這道檢查就會把整段缺口誤判成一次巨大的公司行動。
+      const exchangePrev = Number(row?.exchangePreviousClose);
+      if (!fromYahoo && contiguous && Number.isFinite(exchangePrev) && exchangePrev > 0) {
+        const candidate = exchangePrev / priorClose;
+        if (Math.abs(candidate - 1) > CORPORATE_ACTION_RATIO_TOLERANCE) {
+          ratio = candidate;
+          source = "exchange-quote";
+        }
+      }
     }
+
+    // ---- 第二順位：本機歸檔的官方公告＋公式 ----
+    if (ratio === null && officialAction) {
+      const formulaRatio = officialCorporateActionRatio(officialAction, rawPriorClose);
+      if (formulaRatio !== null) {
+        ratio = formulaRatio;
+        source = "official";
+        rawSpace = true;
+      }
+    }
+
+    // 「交易所說今天有事件」但我們算不出比率 → 不能當作沒事發生。
+    // 上市的官方標記涵蓋全部歷史，比本機歸檔可靠得多（歸檔只從部署後累積）。
+    // 但只有在「該月的計算結果表真的抓成功過」時才算數——否則是我們沒查到，不是資料不完整，
+    // 不該因為上游打嗝就把一批股票踢出候選池（見 corporateActionResultMonthCovered）。
+    const exchangeMarked = Boolean(row?.exchangeCorporateActionMark);
+    const markerActionable = exchangeMarked && corporateActionResultMonthCovered(rowDate);
+    const officialUnresolved = Boolean((officialAction || markerActionable) && ratio === null);
+
+    // ---- 第三順位：跳空推測（只對有漲跌幅限制的普通股成立）----
+    // 跨越資料缺口時不得套 heuristic：那個「跳空」是缺了幾週的正常漲跌，不是公司行動。
+    if (ratio === null && contiguous && (!officialAvailable || allowHeuristicFallback)) {
+      ratio = corporateActionGapRatio(row, priorClose);
+      source = ratio !== null ? (officialAction || exchangeMarked ? "heuristic-incomplete-official" : "heuristic") : "";
+    }
+
     if (ratio !== null) {
-      const stockRatio = Number.isFinite(Number(officialAction?.stockRatio)) ? Math.max(0, Number(officialAction.stockRatio)) : 0;
-      const subscriptionRatio = Number.isFinite(Number(officialAction?.subscriptionRatio)) ? Math.max(0, Number(officialAction.subscriptionRatio)) : 0;
-      adjustments.set(index, {
-        ratio,
-        source,
-        shareFactor: officialAction ? 1 + stockRatio + subscriptionRatio : 1,
-      });
+      let shareFactor = archiveShareFactor ?? 1;
+      // 股數倍數有三種狀態，前兩種是「知道」，第三種一直被當成「知道是 1」——那是 D-29 的核心。
+      //   確定 1     ：官方計算結果表的 kind 不含「權」＝官方認定沒有配股／現增／減資。
+      //   確定精確值 ：本機歸檔有完整且合理的配股率＋現增率（1＋r＋q）。
+      //   不知道     ：kind 含「權」但歸檔沒有那一筆；或整段只有跳空 heuristic。
+      // 第三種目前只能沿用 1（沒有更好的值），但**不可以假裝那是事實**：實測 2026-07-26 的
+      // 2,717 筆官方事件裡，256 筆含權、其中 233 筆歸檔查不到，量比在事件後 20 天內被高估。
+      // 為什麼不用「前收 ÷ 參考價」推：那個等式只對純無償配股成立。實測 6 筆有現增的事件全部
+      // 偏低，最大偏 14.7%（3149 正達：精確 1.2652、估計 1.0787）。TWT49U 的「權值＋息值」欄
+      // 恆等於「前收 − 參考價」，對兩種情形都成立，所以這張表在數學上分不出配股與現增。
+      let shareFactorKnown = archiveShareFactor !== null
+        || Boolean(resultKind && !resultKind.includes("權"));
+      // 但「不知道」不等於「該警告」。上櫃沒有 TWT49U 對應端點（實測：1065 個收錄代號裡只有
+      // 1 個上櫃），所以每一筆用 exchange-quote 認出來的上櫃事件都沒有 kind——而全市場 90.6%
+      // 的事件是純除息、股數根本沒變。對它們全部掛標籤等於在 260 檔裡標 44 檔（實測 16.9%），
+      // 那是雜訊不是訊號。只有拿得到**正面證據**說股數真的變了、卻量不出倍數時才值得說。
+      const shareChangeLikely = resultKind.includes("權")
+        || String(officialAction?.kind || "").includes("權")
+        || String(source || "").startsWith("heuristic"); // 跳空 >10.5%，純配息解釋不了
+      // 同樣是「被調整的那些列在哪個座標系」的問題 → priorFromYahoo。
+      if (priorFromYahoo) {
+        if (rawSpace) {
+          // 知道配股倍數才能換算到 Yahoo 座標系；換算不出來就寧可不調——
+          // 寧可少還原一次現金股利，也不要把配股還原兩次（那會把事件前的價格整段壓低）。
+          const converted = yahooSpaceRatio(ratio, yahooShareFactor);
+          if (converted === null) {
+            unresolvedIndices.push(index);
+            continue;
+          }
+          ratio = converted;
+        }
+        // Yahoo 的成交量同樣已經按分割調整過，不可再乘一次——這是定義上的 1，不是猜的。
+        shareFactor = 1;
+        shareFactorKnown = true;
+      }
+      adjustments.set(index, { ratio, source, shareFactor, shareFactorKnown });
+      if (!shareFactorKnown && shareChangeLikely) shareFactorUnknownIndices.push(index);
     }
     if (officialUnresolved) {
       unresolvedIndices.push(index);
     }
   }
   adjustments.unresolvedIndices = unresolvedIndices;
+  adjustments.historyGapIndices = historyGapIndices;
+  // 有正面證據說股數變了、卻量不出倍數的那些天：成交量沒有按股數還原，
+  // 量比（今日量 ÷ 前 N 日均量）會被高估。
+  adjustments.shareFactorUnknownIndices = shareFactorUnknownIndices;
   return adjustments;
 }
 
@@ -8070,18 +9277,124 @@ function backAdjustForCorporateActions(rows, officialActions, options) {
   return adjusted;
 }
 
+// 還原權息必須在「日 K」層完成，再彙總成週／月，順序不可顛倒。
+// 先彙總再還原的話，除權息當天會先跟同週（同月）其他交易日混成一根，事件前後的價格被平均掉，
+// 還原因子就再也套不到正確的邊界上：那根週 K 會同時留著「還原前的開盤」與「還原後的收盤」，
+// 憑空長出一根假長黑，而且之後每一根的相對位置全歪。
+function buildAdjustedPeriodRows(dailyHistory, officialActions, {
+  period = "day",
+  allowHeuristicFallback = false,
+  maxBars = 180,
+} = {}) {
+  const complete = (row) => [row.open, row.high, row.low, row.close].every(Number.isFinite);
+  // 先在日線層濾掉半根 K：缺 close 會直接斷掉還原因子的推導鏈（前收拿不到就算不出比率），
+  // 留著只會讓某個事件被靜默跳過。
+  const dailyRows = (dailyHistory || []).filter(complete);
+  const options = { allowHeuristicFallback };
+  const adjustments = resolveCorporateActionAdjustments(dailyRows, officialActions, options);
+  const adjustedDaily = backAdjustForCorporateActions(dailyRows, officialActions, options);
+  const allPeriods = addPreviousClose(aggregateHistoryByPeriod(adjustedDaily, period)).filter(complete);
+  const rows = maxBars > 0 ? allPeriods.slice(-maxBars) : allPeriods;
+
+  // 只有落在可見區間內的事件會影響畫面：還原因子從最後一根往回累乘，一個事件只調整
+  // 「它之前」的 K。所以比第一根可見 K 更早的事件對這張圖毫無作用，列出來只會讓使用者
+  // 以為圖上有他看不到的調整。事件正好落在第一根可見 K 當天也一樣——被調整的全在畫面外。
+  const cut = allPeriods.length - rows.length;
+  const lastHiddenDate = cut > 0 ? toCompactDate(allPeriods[cut - 1]?.date) : "";
+  // 週／月 K 的 date 是該期間的最後一個交易日，所以可見起點要換算回「日」層再比。
+  const firstVisibleDate = dailyRows
+    .map((row) => toCompactDate(row.date))
+    .find((date) => date && (!lastHiddenDate || date > lastHiddenDate)) || "";
+  const dateAt = (index) => toCompactDate(dailyRows[index]?.date);
+  const inWindow = (index) => {
+    const date = dateAt(index);
+    return Boolean(date) && Boolean(firstVisibleDate) && date > firstVisibleDate;
+  };
+  const events = [...adjustments.entries()]
+    .filter(([index]) => inWindow(index))
+    .map(([index, adjustment]) => ({
+      date: dateAt(index),
+      source: adjustment.source,
+      ratio: roundTo(adjustment.ratio, 4),
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const unresolvedDates = (adjustments.unresolvedIndices || [])
+    .filter((index) => inWindow(index))
+    .map((index) => dateAt(index))
+    .filter(Boolean);
+
+  const hasOfficial = events.some((event) => isOfficialCorporateActionSource(event.source));
+  const hasEstimated = events.some((event) => !isOfficialCorporateActionSource(event.source));
+  const officialCount = events.filter((event) => isOfficialCorporateActionSource(event.source)).length;
+  const estimatedCount = events.length - officialCount;
+  // 用詞受 stock1-domain 約束：只有官方公告可以講「除權息」，跳空推測一律寫「疑似／估算還原」，
+  // 不能讓使用者以為那天一定發生過公司行動。
+  const notes = [];
+  if (officialCount > 0) {
+    notes.push(`圖上歷史價格已依官方除權息公告還原 ${officialCount} 次，與當時的實際成交價不同；最新一根維持實際價格。`);
+  }
+  if (estimatedCount > 0) {
+    notes.push(`另有 ${estimatedCount} 次為「疑似公司行動」的跳空估算還原（非官方確認），僅供圖形參考。`);
+  }
+  if (unresolvedDates.length > 0) {
+    notes.push(`${unresolvedDates.map(compactToSlashDate).join("、")} 官方公司行動的公式欄位尚未齊備，該日之前的價格未經正確還原，暫不提供型態結論。`);
+  }
+  if (!allowHeuristicFallback) {
+    notes.push("ETF／權證等商品沒有 ±10% 漲跌幅前提，不套用跳空估算還原，只在有官方公告時還原。");
+  }
+  return {
+    rows,
+    corporateActions: {
+      adjusted: events.length > 0,
+      source: hasOfficial && hasEstimated ? "mixed" : hasOfficial ? "official" : hasEstimated ? "heuristic" : "",
+      events,
+      unresolvedDates,
+      heuristicAllowed: Boolean(allowHeuristicFallback),
+      // 升級成醒目提示的條件：只要圖上有「非官方確認」的估算還原，或有算不出來的官方事件。
+      // 純官方還原是正常且精確的，天天都會發生（台股大多年年配息），不該長年掛著警示。
+      alert: unresolvedDates.length > 0 || hasEstimated,
+      notes,
+    },
+  };
+}
+
+// 台股漲停＝前收 × 1.1，再**向下**取到合法申報價位。所以「漲幅 ≥ 9.5%」判漲停並不精確：
+// 實測前收 99.5 的漲停是 109（+9.55%）、前收 990 是 1085（+9.60%），低價股更接近 9.5 的邊界。
+// 一定要反推真實漲停價再比對。
+function stockLimitUpPrice(previousClose) {
+  if (!Number.isFinite(previousClose) || previousClose <= 0) return null;
+  return roundToStockTick(previousClose * 1.1, "down");
+}
+
+// 「收在漲停」不等於「買不到」——實測 240 檔逐日回放 3,571 個合格 pick 裡有 233 個（6.52%）
+// 收在漲停價，但其中 231 個盤中有開（high > low），整天都買得到，只是收盤剛好落在漲停。
+// 真正買不到的是**一價鎖死**：整天只有漲停這一個成交價（2 個，0.06%）。
+function isLimitUpLockedBar(row, previousRow) {
+  const limit = stockLimitUpPrice(Number(previousRow?.close));
+  if (limit === null) return false;
+  const high = Number(row?.high);
+  const low = Number(row?.low);
+  const close = Number(row?.close);
+  if (![high, low, close].every(Number.isFinite)) return false;
+  return high === low && Math.abs(close - limit) < 1e-9;
+}
+
 function computeSwingFeatures(rawRows, officialActions, options) {
   if (rawRows.length < 60) return null;
   const adjustments = resolveCorporateActionAdjustments(rawRows, officialActions, options);
   const recentStart = Math.max(1, rawRows.length - 21);
   const recentAdjustments = [...adjustments.entries()].filter(([index]) => index >= recentStart);
   const recentCorporateGap = recentAdjustments.length > 0; // 舊欄名相容；現在可由官方或降級估算觸發
-  const hasRecentOfficial = recentAdjustments.some(([, adjustment]) => adjustment.source === "official");
-  const hasRecentHeuristic = recentAdjustments.some(([, adjustment]) => adjustment.source !== "official");
+  const hasRecentOfficial = recentAdjustments.some(([, adjustment]) => isOfficialCorporateActionSource(adjustment.source));
+  const hasRecentHeuristic = recentAdjustments.some(([, adjustment]) => !isOfficialCorporateActionSource(adjustment.source));
   const recentCorporateActionSource = hasRecentOfficial && hasRecentHeuristic
     ? "mixed"
     : hasRecentOfficial ? "official" : hasRecentHeuristic ? "heuristic" : "";
   const corporateActionUnresolvedIndices = adjustments.unresolvedIndices || [];
+  // 漲停鎖死：整天只有一個成交價、而且那個價就是漲停價 → 掛買單根本排不到，
+  // 而 plan.entry 取的正是當日收盤（D-23）。必須用**原始價**判斷：rows 是還原後的，
+  // 還原會把事件前的價格整段縮放，拿它比漲停價一定不準。
+  const limitUpLocked = isLimitUpLockedBar(rawRows.at(-1), rawRows.at(-2));
   const rows = backAdjustForCorporateActions(rawRows, officialActions, options);
   const lastIndex = rows.length - 1;
   const last = rows[lastIndex];
@@ -8123,11 +9436,33 @@ function computeSwingFeatures(rawRows, officialActions, options) {
     else break;
   }
 
-  // 回檔深度：近 20 日高點到「站穩前的回檔低點」。
+  // 回檔深度：近 20 日高點，到**那個高點之後**的最低價（D-11）。
+  // 舊寫法 recentHigh 取近 20 根、pullbackLow 取近 12 根——兩個視窗長度不同，而且完全沒有
+  // 要求低點發生在高點之後。算出來的是「區間振幅」，不是回檔深度；註解自稱「高點到站穩前的
+  // 回檔低點」，程式沒有實作那個「之後」。實測 240 檔逐日回放 29,616 次：46.4% 的數值會變，
+  // 例如 3481 群創 2026/05/25 由 41.65% 變成 0.00%——那 41.65% 是整段漲勢的振幅，
+  // 該股當天還在創新高，根本沒有回檔過。
+  // 視窗統一成 20 根：時序約束本身就會把搜尋範圍收斂到高點之後，不需要第二個長度。
   const window20 = rows.slice(-20);
-  const recentHigh = Math.max(...window20.map((row) => row.high).filter(Number.isFinite));
-  const pullbackLow = Math.min(...rows.slice(-12).map((row) => row.low).filter(Number.isFinite));
-  const pullbackDepthPct = Number.isFinite(recentHigh) && recentHigh > 0
+  let recentHigh = -Infinity;
+  let highIndex = -1;
+  for (let index = 0; index < window20.length; index += 1) {
+    const high = Number(window20[index].high);
+    // 用 `>` 保留**最早**出現的那根高點：同價位再次觸及時，從第一次算起才涵蓋得到中間的回檔。
+    if (Number.isFinite(high) && high > recentHigh) { recentHigh = high; highIndex = index; }
+  }
+  // 高點就是最後一根＝還在創新高，**還沒有一段完成的回檔**。這時 pullbackLow 是 null 而不是
+  // 「今天的最低價」——拿當日的上影線當回檔會憑空生出一個幅度，量測幅度也會跟著失真。
+  let pullbackLow = highIndex >= 0 && highIndex < window20.length - 1 ? Infinity : null;
+  if (pullbackLow !== null) {
+    for (let index = highIndex + 1; index < window20.length; index += 1) {
+      const low = Number(window20[index].low);
+      if (Number.isFinite(low) && low < pullbackLow) pullbackLow = low;
+    }
+    if (!Number.isFinite(pullbackLow)) pullbackLow = null;
+  }
+  if (highIndex < 0) recentHigh = NaN;
+  const pullbackDepthPct = Number.isFinite(recentHigh) && recentHigh > 0 && Number.isFinite(pullbackLow)
     ? ((recentHigh - pullbackLow) / recentHigh) * 100
     : 0;
 
@@ -8179,6 +9514,21 @@ function computeSwingFeatures(rawRows, officialActions, options) {
     recentCorporateActionSource,
     corporateActionUnresolved: corporateActionUnresolvedIndices.length > 0,
     corporateActionUnresolvedDates: corporateActionUnresolvedIndices.map((index) => toCompactDate(rawRows[index]?.date)).filter(Boolean),
+    // 歷史序列有日期缺口（多半是逐檔月歷史被限流、失敗被吞成空陣列）：跳空不套 heuristic，
+    // 但均線／通道會跨越缺口計算，數值仍不完全可信，必須讓上層看得到。
+    historyGap: (adjustments.historyGapIndices || []).length > 0,
+    historyGapDates: (adjustments.historyGapIndices || [])
+      .map((index) => toCompactDate(rawRows[index]?.date)).filter(Boolean),
+    // 配股／現增／減資會改變股數，成交量要按同一個倍數還原才可比。倍數推導不出來時
+    // （官方結果表說有「權」但歸檔沒有那一筆，或整段只有跳空推測）沿用 1——這會讓事件前的
+    // 均量偏低、量比偏高。只有落在量比視窗（前 20 根）內的才影響得到數字。
+    // 進場價（＝當日收盤）今天根本掛不到單：整天只有漲停這一個成交價。
+    limitUpLocked,
+    volumeFactorUnknown: (adjustments.shareFactorUnknownIndices || [])
+      .some((index) => index >= rawRows.length - 20),
+    volumeFactorUnknownDates: (adjustments.shareFactorUnknownIndices || [])
+      .filter((index) => index >= rawRows.length - 20)
+      .map((index) => toCompactDate(rawRows[index]?.date)).filter(Boolean),
     atr: averageTrueRange(rows, 14),
     rows,
   };
@@ -8188,10 +9538,23 @@ function computeSwingFeatures(rawRows, officialActions, options) {
 const SWING_NEAR_BAND_SIGMA = 1.0; // 距中軌 ≤1.0σ 才算「貼著中軌防守」（0=中軌、2σ=上軌；>1σ 已往上軌走，屬突破/追高，不是中軌攻防）
 const SWING_MIN_GOLDEN_DAYS = 2;   // MACD 需「連續≥2天」維持金叉，濾掉單根 K 的臨界假訊號（whipsaw）
 const SWING_MAX_DOWN_DAY = -6;     // 「站穩」要件：當日(還原後)跌幅不得超過 6%，擋掉雖在中軌上方但今天正在破底/跌停的股
-const SWING_MIN_RR = 1;            // 盈虧比下限：報酬至少要等於風險(RR≥1)才入選。RR<1 的設定不值得做，也順帶淘汰「離中軌過遠→停損遠→RR爛」的股
+const SWING_MIN_RR = 1;            // 盈虧比下限，套在**淨** RR（已扣來回成本）上：報酬至少要等於風險才入選。也順帶淘汰「離中軌過遠→停損遠→RR爛」的股
 const SWING_MIN_SCAN_COVERAGE = 0.7; // 至少 70% 候選有當日新鮮歷史，才可寫正式每日快照／驗證單。
 // 選股邏輯版本：改動後快照版本不符就重算，避免沿用舊邏輯算出的清單（也讓「更完整才覆蓋」只在同版本內比較）。
-const SWING_FORMULA_VERSION = "swing-v16-official-corporate-actions";
+// v18：拿掉目標價的「至少 +3%」下限（D-25）。那道下限會在上方壓力很近時把目標硬抬過壓力，
+// reward 憑空變大、RR 虛胖，讓本該被 SWING_MIN_RR 剔除的設定通過——RR≥1 這道關等於失效。
+// 實測 2026-07-24：13 檔通過 RR≥1 的標的裡，有 6 檔的目標是被這道下限抬上去的。
+// 必須升版：驗證單記錄的是建立當下的 target，混在同一個分母裡等於把「目標被膨脹過的交易」
+// 與「目標誠實的交易」當成同一組樣本統計，而兩者的觸價難度本質上不同。
+// v17 只累積了不到一天的 pending 樣本、尚未產生任何已顯示的統計，代價極小。
+// v19：回檔深度加上「低點必須在高點之後」的時序約束（D-11）。門檻數字沒動，但
+// pullbackDepthPct 與量測幅度的算法變了，會改變哪些標的通過「曾回檔 ≥3%」與 RR≥1。
+// v21：SWING_MIN_RR 改套在**淨** RR（已扣 0.471% 來回成本）上。門檻數字沒動，但毛 RR
+// 1.0~1.2 那一段會被剔除——那些是「看起來剛好過關、扣掉成本其實賠錢」的設定。
+// v20：走 Yahoo 備援時最後一根 K 的成交金額改由整批收盤補回（原本恆為 null）。
+// scoreSwing 的流動性項最多 10 分，補回來之後排序會變 → 影響 recordSwingVerification
+// 每個場景取前 40 檔的挑選順序，所以要與舊樣本分開統計。
+const SWING_FORMULA_VERSION = "swing-v21-net-rr-gate";
 
 // 台股普通股升降單位：策略建議價必須是交易所可申報的價格，不能只四捨五入到小數二位。
 function stockTickSize(price) {
@@ -8254,6 +9617,8 @@ const SWING_SCENARIOS = [
         ? "近期除權息(官方已還原)"
         : f.recentCorporateActionSource === "mixed" ? "近期權息含疑似跳空(官方＋估算還原)" : "近期疑似權息跳空(估算還原)");
       if (f.corporateActionUnresolved) warns.push("公司行為公式資料未完整");
+      if (f.historyGap) warns.push("官方歷史有日期缺口(均線可能失真)");
+      if (f.volumeFactorUnknown) warns.push("配股比率未公告(量比可能偏高)");
       return { checks, passed, warns, desc: `回檔中軌後站穩${f.daysAboveMid}天，MACD連續${f.goldenCrossDays}天維持金叉` };
     },
     detect(f) {
@@ -8293,6 +9658,8 @@ const SWING_SCENARIOS = [
         ? "近期除權息(官方已還原)"
         : f.recentCorporateActionSource === "mixed" ? "近期權息含疑似跳空(官方＋估算還原)" : "近期疑似權息跳空(估算還原)");
       if (f.corporateActionUnresolved) warns.push("公司行為公式資料未完整");
+      if (f.historyGap) warns.push("官方歷史有日期缺口(均線可能失真)");
+      if (f.volumeFactorUnknown) warns.push("配股比率未公告(量比可能偏高)");
       return { checks, passed, warns, desc: `沿上軌強勢，MACD連續${f.goldenCrossDays}天維持金叉${f.histRising ? "、柱狀放大" : ""}` };
     },
     detect(f) {
@@ -8330,21 +9697,62 @@ function buildSwingPlan(features) {
   // 目標優先用「上方最近的壓力」（擺動高點中高於現價者取最低的那個）；
   // 若已創新高、上方無壓力，改用「量測幅度」（本波回檔前的高低差往上投射）。
   // 這樣盈虧比會隨個股結構自然變化（接近壓力 RR 小、剛起漲 RR 大），而不是恆等於 2R。
-  const overheadHighs = features.swings.highs
+  // `> entry × 1.02` 這道過濾**刻意保留**，而且它不是 D-25 那類的缺陷。
+  // 「上軌續攻」選的就是貼著近期高點的股票，所以最近的擺動高點必然貼著收盤價：
+  // 實測 2026-07-24 通過的 16 檔裡有 11 檔的最近擺動高點在 +0.11%~+1.81%（陽明 +0.11%、
+  // 聯強 +0.23%、興富發 +0.34%），拿它們當目標算出來的 RR 是 0.00~0.53，整批會被剔除。
+  // 那些價位不是「可以獲利了結的壓力」，是收盤價本身的雜訊。
+  // 與 D-25 的差別：+3% 下限是把目標**抬到壓力之上**（憑空造出報酬）；這道過濾是**跳過
+  // 不能用的價位**改用量測幅度，是不同的操作。
+  // 但被跳過的價位仍然是真實的關卡（例如威強電壓力在 +1.81%、目標卻在 +15%），
+  // 所以下面把它一起回傳，讓畫面說出來——不改數字，只是不再隱瞞。
+  const upperHighs = features.swings.highs
     .map((point) => point.price)
-    .filter((price) => Number.isFinite(price) && price > entry * 1.02);
+    .filter((price) => Number.isFinite(price) && price > entry);
+  const nearestResistance = upperHighs.length ? Math.min(...upperHighs) : null;
+  const overheadHighs = upperHighs.filter((price) => price > entry * 1.02);
   const overhead = overheadHighs.length ? Math.min(...overheadHighs) : null;
-  const measuredMove = Number.isFinite(features.recentHigh) && Number.isFinite(features.pullbackLow)
-    ? entry + (features.recentHigh - features.pullbackLow)
+  // 量測幅度＝「本波回檔的高低差」往上投射。加上 D-11 的時序約束之後，這個幅度可能退化成 0
+  // （高點就是最後一根，還沒回檔過）——那時量測幅度是**沒有定義**，不是零。
+  // 舊寫法沒有區分，rawTarget 會等於 entry、target 取整後 reward=0、rr=0。
+  // 順帶修掉一個死碼：`entry + risk * 2` 這條兜底原本永遠到不了（measuredMove 在兩個呼叫端
+  // 都不可能是 null，因為它們已先把列過濾成 OHLC 全部有限），現在它才真的會被用到。
+  const swingRange = Number.isFinite(features.recentHigh) && Number.isFinite(features.pullbackLow)
+    ? features.recentHigh - features.pullbackLow
     : null;
+  const measuredMove = Number.isFinite(swingRange) && swingRange > 0 ? entry + swingRange : null;
+  // 結構停損至少留 2% 風險（見上面的 clamp），所以 2R 一定大於一個升降單位，不會退化成 entry。
   const rawTarget = overhead ?? measuredMove ?? entry + risk * 2;
-  const conservativeTarget = roundToStockTick(rawTarget, "down");
-  const minimumTarget = roundToStockTick(entry * 1.03, "up");
-  const target = Math.max(conservativeTarget, minimumTarget); // 合法檔位且至少 +3%；其餘仍向下取整避免高估報酬
+  // D-25：舊寫法是 Math.max(conservativeTarget, roundToStockTick(entry * 1.03, "up"))，
+  // 也就是「目標至少 +3%」的下限。它與同一行註解宣稱的「向下取整避免高估報酬」正好相反：
+  // 上方壓力若只在 +1%，下限會把目標硬抬到壓力之上，reward 憑空變大、RR 跟著虛胖，
+  // 於是本該被 SWING_MIN_RR 剔除的設定剛好通過。實測 2026-07-24：現行 13 檔通過 RR≥1，
+  // 其中 6 檔的目標是被這道下限抬上去的（中租-KY 1.0→1.6、興富發 1.0→1.5）。
+  // 下限的用意應該是「不要提出目標太小的交易」，但正確的回應是**拒絕這筆交易**（RR 不足），
+  // 不是把目標膨脹到通過門檻。拿掉之後 RR≥1 這道關才真的在做它宣稱的事。
+  const target = roundToStockTick(rawTarget, "down"); // 一律向下取整，不再有下限
 
   const reward = target - entry;
   const rr = risk > 0 ? roundTo(reward / risk) : null;
-  return { entry, initialStop, trailingTrigger, structuralStop, target, rr };
+  // 淨盈虧比：來回成本打**兩邊**——它同時吃掉報酬、又墊高實際虧損。
+  //   淨報酬 = 目標 − 進場 − 成本×進場       淨風險 = 進場 − 停損 + 成本×進場
+  // 所以淨 RR = 1 的臨界是「reward − risk > 2 × 成本 × 進場價」＝ 進場價的 0.942%。
+  // 這是 `SWING_MIN_RR` 真正該把關的數字：那道門檻宣稱「風險大於報酬的設定不值得做」，
+  // 用毛價算的話在邊緣區間根本沒做到——實測 2026-07-24 通過毛 RR≥1 的 16 檔裡，
+  // 5 檔的淨 RR 其實 <1（中租-KY 1.00→0.63、至上 1.10→0.75、聯強 1.10→0.75）。
+  // 這與 D-25 拿掉 +3% 下限是同一類問題：一道門檻沒有在做它宣稱的事。
+  // 毛 RR 仍然保留並顯示——它是「圖上的結構」；淨 RR 是「值不值得做」，用它把關。
+  // 成本本身仍是低估：VERIFY_COST_NOTE 已載明未計每筆最低 20 元手續費與滑價。
+  const costPerShare = entry * (VERIFY_ROUND_TRIP_COST_PCT / 100);
+  const netRisk = risk + costPerShare;
+  const rrNet = netRisk > 0 ? roundTo((reward - costPerShare) / netRisk) : null;
+  return {
+    entry, initialStop, trailingTrigger, structuralStop, target, rr, rrNet,
+    // 被 2% 過濾跳過的最近壓力：不影響目標，但使用者該知道上方還有關卡。
+    nearestResistance: nearestResistance !== null && (overhead === null || nearestResistance < overhead)
+      ? roundTo(nearestResistance)
+      : null,
+  };
 }
 
 // 0~100 連續評分：趨勢結構 + MACD 動能 + 攻防區位置 + 量能 + 流動性。權重可調。
@@ -8398,6 +9806,9 @@ function buildSwingPick(quote, features, scenario, plan, score) {
     changePct: roundTo(features.changePct),
     avgVolLots: Math.round(features.avgVol20 || 0),
     volumeRatio5: roundTo(features.volumeRatio5),
+    // 今天整天只有漲停這一個成交價 → plan.entry 掛不到單。標示而不剔除：訊號本身是真的
+    //（這檔確實強勢），只是今天這個價位進不去，明天的價格也不會是這個 entry。
+    fillRisk: features.limitUpLocked ? "limit-up-locked" : null,
     plan,
     indicators: {
       ma5: roundTo(features.ma5),
@@ -8449,6 +9860,16 @@ function resolveMarketCloseDate(reference) {
 function appendTodayCloseBar(history, quote, latestDate) {
   const latestHistDate = history.length ? toCompactDate(history[history.length - 1].date) : "";
   const quoteDate = toCompactDate(quote.asOf || quote.rawDate);
+  // 歷史已經涵蓋到報價那一天 → 不必補一根，但**成交金額要補回去**。
+  // Yahoo 備援序列的每一根 tradeValue 都是 null（chart API 根本沒有這個欄位），走到那條
+  // 路徑時整批收盤的成交金額就進不了最後一根 K，下游的「低流動性」全部退化成「成交值未知」
+  // ——實測連台積電都會這樣，流動性標籤等於失效，而它正是 D-33 要用來判斷的依據。
+  // 兩者是同一個交易日、同一個官方來源（STOCK_DAY_ALL／上櫃整批收盤），補進去就是同一個數字。
+  // 用 slice+concat 換掉最後一根而不是就地改：history 可能來自模組級快取，不可就地變更。
+  if (quoteDate && quoteDate === latestHistDate && Number.isFinite(quote.tradeValue)
+    && !Number.isFinite(history[history.length - 1]?.tradeValue)) {
+    history = history.slice(0, -1).concat([{ ...history[history.length - 1], tradeValue: quote.tradeValue }]);
+  }
   if (
     !quoteDate || quoteDate <= latestHistDate || quoteDate > latestDate ||
     ![quote.open, quote.high, quote.low, quote.price].every(Number.isFinite)
@@ -8466,10 +9887,13 @@ function appendTodayCloseBar(history, quote, latestDate) {
     low: quote.low,
     close: quote.price,
     previousClose: quote.previousClose ?? null,
+    // 這是用整批收盤現價補出來的當日 K，不是逐檔歷史，沒有交易所漲跌價差欄可依據。
+    exchangePreviousClose: null,
+    exchangeCorporateActionMark: false,
     change: null,
     volumeShares: Number.isFinite(quote.volumeLots) ? quote.volumeLots * 1000 : null,
     volumeLots: Number.isFinite(quote.volumeLots) ? quote.volumeLots : null,
-    tradeValue: null,
+    tradeValue: Number.isFinite(quote.tradeValue) ? quote.tradeValue : null,
     transactions: quote.transactions ?? null,
     source: "STOCK_DAY_ALL official close (appended)",
   }]);
@@ -8520,6 +9944,19 @@ function pruneSwingVerification(store, keepDays = 90) {
 
 // 看板掃描完成時記錄驗證單（同日去重、每場景最多 40 檔＝前端顯示上限）。
 // entry 一旦建立就不可回溯刪除——它是「當時真的出現過的建議」；公式改版用 formulaVersion 區分統計。
+// D-30：驗證單要記下「這筆訊號成立當時，這檔是怎麼撮合的」。
+// 處置期間是分盤集合競價（每 5 或 20 分鐘撮合一次），日 K 的 high/low 只是幾十次撮合的極值，
+// 掛在停損／目標的單未必真的撮得到。判定規則刻意不動（改口徑要另外決策），
+// 但樣本裡必須留下這個事實，否則成績單分不出「連續競價下真的觸價」與「分盤下理論上碰到」。
+// 而且沒存這欄的話，使用者就算在「更多→風險規則」關掉處置股，成績單也過濾不掉它們。
+function swingVerificationFillModel(surveillance) {
+  if (!surveillance || surveillance.kind !== "disposition") return "continuous";
+  const interval = Number(surveillance.interval);
+  if (interval === 5) return "periodicCall5";
+  if (interval === 20) return "periodicCall20";
+  return "periodicCall"; // 確定是處置，但看板沒熱、拿不到分盤間隔
+}
+
 function recordSwingVerification(db, body) {
   const day = toCompactDate(body?.asOf);
   if (!day || !Array.isArray(body?.picks) || body.provisional || body.coverage?.complete === false) return;
@@ -8541,8 +9978,18 @@ function recordSwingVerification(db, body) {
     if (seen.has(key)) continue;
     const plan = pick.plan || {};
     if (!Number.isFinite(plan.entry) || !Number.isFinite(plan.structuralStop) || !Number.isFinite(plan.target)) continue;
+    // 漲停鎖死那天的收盤價掛不到單，這筆「交易」在真實世界不存在。建立驗證單等於憑空多一個
+    // 起跑點極度有利的樣本——隔天只要高點過目標就記一筆勝利，勝率被灌水（D-23）。
+    // 標的本身照樣留在看板上（標 fillRisk），只是不進統計分母。
+    if (pick.fillRisk === "limit-up-locked") continue;
     seen.add(key);
     perScenario.set(scenarioVersion, (perScenario.get(scenarioVersion) || 0) + 1);
+    // 只留判定用得到的欄位，不整包塞進去：驗證單留 90 天，寫進去的東西就是不可回溯的歷史。
+    const surveillance = pick.surveillance ? {
+      kind: String(pick.surveillance.kind || ""),
+      label: String(pick.surveillance.label || ""),
+      interval: Number.isFinite(Number(pick.surveillance.interval)) ? Number(pick.surveillance.interval) : null,
+    } : null;
     list.push({
       code: pick.code,
       name: pick.name,
@@ -8553,6 +10000,8 @@ function recordSwingVerification(db, body) {
       rr: plan.rr ?? null,
       score: pick.score ?? null,
       formulaVersion: bodyVersion,
+      surveillance,
+      fillModel: swingVerificationFillModel(surveillance),
       status: "pending", // pending | win | loss | expired
       resolvedAt: null,
       resultPct: null,
@@ -8562,7 +10011,7 @@ function recordSwingVerification(db, body) {
     changed = true;
   }
   if (pruneSwingVerification(db.swingVerification, 90)) changed = true;
-  if (changed) swingVerifySummaryCache = { expiresAt: 0, value: null };
+  if (changed) invalidateSwingVerifySummaryCache();
   return changed;
 }
 
@@ -8570,6 +10019,16 @@ function recordSwingVerification(db, body) {
 // 規則：日期沒前進不動（防同日重跑、天然擋上市/上櫃收盤檔時間差）；
 // 同日雙觸（低點破停損且高點過目標）保守記停損——日 K 沒有盤中序列，統計寧可偏保守；
 // 跳空直接越過停損/目標時用開盤價計實際出場（更誠實的滑價）；15 個交易日沒碰到＝以收盤結案。
+// ---- 勝率的最小樣本門檻（D-27）----
+// 舊行為：只要有 1 筆結案就給百分比，前端還依 >=50% 染成紅／綠。問題有三層：
+// (1) 樣本數 1 的「勝率 100%」沒有任何統計意義，但視覺上跟累積數十筆的綠字長得一樣；
+// (2) winRate 的分母只算已結案，而 win/loss 一碰價就結案（常 1~3 天）、expired 一定要等第 15 個
+//     交易日——累積初期分母裡幾乎只有快速觸價的極端樣本，勝率會先高後低，看起來像策略壞掉，
+//     其實只是分母組成在變；
+// (3) 同一天選出的 20~40 檔高度共享大盤 beta，當成獨立樣本會嚴重高估精度。
+// 門檻取 20：低於它一律回 null，讓前端顯示「樣本累積中 n/20」且不染色。
+// 這只影響「要不要把百分比當結論呈現」，不改變任何選股結果。
+const WIN_RATE_MIN_SAMPLES = 20;
 const SWING_VERIFY_MAX_DAYS = 15;
 function advanceSwingVerificationEntry(entry, dayQuote) {
   if (!entry || entry.status !== "pending" || !dayQuote) return false;
@@ -8590,8 +10049,29 @@ function advanceSwingVerificationEntry(entry, dayQuote) {
     entry.resolvedAt = day;
     entry.resultPct = roundTo(((exitPrice - entry.entry) / entry.entry) * 100);
   };
+  // D-24 裁決：開盤價優先於「同日雙觸保守記停損」。
+  //
+  // 「雙觸保守記停損」的前提是「日 K 沒有盤中序列，不知道先碰哪一邊」。但台股開盤是
+  // **集合競價**，是當日第一筆成交且時序完全確定——開盤價若已越過某一邊，掛在那個價位的
+  // 單就是在那一撮成交的，沒有先後可猜。前提不成立時，保守規則就不該套用。
+  //
+  // 舊寫法把停損判定放在目標之前且不看開盤：只要 low <= stop 就一律 loss。
+  // entry 100／stop 95／target 110，當日 open 112、high 113、low 94 → 記成 loss −5%，
+  // 但實際上 09:00 開盤 112 就成交了，是 win +12%（誤差 17 個百分點，而且勝負反向）。
+  // 偏誤是單向的：只會把真實的獲利記成虧損，不會反過來，所以會系統性低估勝率與平均報酬。
+  //
+  // 舊寫法對「開盤跳空跌破停損」其實處理對了（open < stop 時用 open 出場），
+  // 可見作者本來就接受「開盤越過該價位時以開盤價成交」，只是漏了另一半。
+  if (Number.isFinite(open) && open <= entry.stop) {
+    resolve("loss", open);
+    return true;
+  }
+  if (Number.isFinite(open) && open >= entry.target) {
+    resolve("win", open);
+    return true;
+  }
   if (low <= entry.stop) {
-    resolve("loss", Number.isFinite(open) && open < entry.stop ? open : entry.stop);
+    resolve("loss", entry.stop);
     return true;
   }
   if (high >= entry.target) {
@@ -8615,7 +10095,84 @@ function normalizeSwingVerificationQuote(row) {
     high: row.high,
     low: row.low,
     price: row.price ?? row.close,
+    // 交易所自己的昨收：除權息／減資當天它就是官方參考價（漲跌價差是相對參考價算的）。
+    //
+    // 一律讀永不被覆寫的 `exchangePreviousClose`，**不可**退回 `previousClose`：
+    // Yahoo 備援序列與「用整批收盤補出來的當日 K」都會把 previousClose 填成前一列的收盤
+    // （normalizeYahooHistoryRows / appendTodayCloseBar 各自都這麼做），拿它算比率恆等於 1，
+    // 於是「算不出比率」會偽裝成「已確認這天沒有公司行動」——正是這批停等要擋的情形。
+    exchangePreviousClose: row.exchangePreviousClose ?? null,
+    // 上市在除權息日把漲跌價差欄整欄遮成 "X0.00"，交易所自己的事件標記涵蓋全部歷史，
+    // 比只從部署後累積的本機歸檔可靠。它只說「有事件」，不說比率。
+    exchangeCorporateActionMark: Boolean(row.exchangeCorporateActionMark),
+    // Yahoo 的 OHLC 已自行把配股當分割還原過，與官方逐檔歷史不是同一個座標系。
+    fromYahoo: String(row.source || "").startsWith("Yahoo"),
   };
+}
+
+// 除權息／減資造成的價格跳空是機械性的，不是真的漲跌。驗證單若拿原始價比對含息的
+// entry/stop/target，除息當天會被記成假停損（實測：配息 5 元、參考價 95、當天相對參考價
+// 收平盤，仍會 low(95) <= stop(95) 記 loss −5%，而投資人同時領到 5 元現金股利）。
+// 這裡用「交易所官方昨收 ÷ 前一根實際收盤」推出調整比率，把 entry/stop/target 一起搬到
+// 事件後的價格尺度；因為股利已內含在比率裡，之後算出的 resultPct 就是含息總報酬。
+const CORPORATE_ACTION_RATIO_TOLERANCE = 0.002; // 0.2%：小於此視為捨入誤差，不動計畫價
+
+// 一個事件日的比率有**三種**結果，呼叫端必須分得開：
+//   quantified=true  ／ ratio 有值  → 算出來了，要把計畫價搬到事件後的尺度
+//   quantified=true  ／ ratio=null → 算出來了，但幅度在容忍度內＝確認不必調
+//   quantified=false               → 算不出來。這**不等於**「沒事發生」
+// 舊寫法把後兩者都回單一個 null，於是「算不出比率」與「確認沒有事件」在呼叫端長得一模一樣，
+// 兩層來源同時失效時就靜默拿事件前的計畫價去比事件後的價格（＝假停損／假達標）。
+function swingVerificationActionRatio(row, previousRow, { adjacent = true } = {}) {
+  const unknown = { quantified: false, ratio: null };
+  // Yahoo 座標系的列不可拿來推官方比率：它沒有交易所昨收，OHLC 也已自行還原過配股。
+  if (row?.fromYahoo || previousRow?.fromYahoo) return unknown;
+  // 必須要求相鄰：逐月歷史抓取失敗會被吞成空陣列，缺口前後直接接起來之後，
+  // 「交易所昨收」講的是真正的前一個交易日、priorClose 卻是幾週前那根，硬算會把
+  // 整段正常漲跌記成一次巨大的公司行動（實測：收平盤的股票被記成 −20% 停損）。
+  if (!adjacent) return unknown;
+  const exchangePreviousClose = Number(row?.exchangePreviousClose);
+  const priorClose = Number(previousRow?.price);
+  if (!Number.isFinite(exchangePreviousClose) || exchangePreviousClose <= 0) return unknown;
+  if (!Number.isFinite(priorClose) || priorClose <= 0) return unknown;
+  const ratio = exchangePreviousClose / priorClose;
+  if (!Number.isFinite(ratio) || ratio <= 0) return unknown;
+  return { quantified: true, ratio: Math.abs(ratio - 1) > CORPORATE_ACTION_RATIO_TOLERANCE ? ratio : null };
+}
+
+// 同一天可能同時來自「官方逐檔月歷史」與「整批收盤」（advanceSwingVerification 直接把兩者
+// 接成 [...history, ...directRows]）。OHLC 取後到的整批收盤——那是權威收盤價，與原本
+// Map 後者覆蓋前者的語意一致。但公司行動欄位**不可以**跟著被覆蓋：整批收盤補出來的當日 K
+// 沒有交易所漲跌價差欄（appendTodayCloseBar 明寫 exchangePreviousClose: null），
+// 讓它整列蓋掉官方逐檔列等於把當天唯一的比率來源丟掉，除權息那天就只剩停等。
+// 座標系不可混：任一邊來自 Yahoo 時就不繼承對方的官方欄位。
+function mergeSwingVerificationQuote(previous, row) {
+  const merged = { ...row };
+  if (!row.fromYahoo && !previous.fromYahoo) {
+    merged.exchangePreviousClose = row.exchangePreviousClose ?? previous.exchangePreviousClose ?? null;
+    merged.exchangeCorporateActionMark = Boolean(row.exchangeCorporateActionMark || previous.exchangeCorporateActionMark);
+  }
+  return merged;
+}
+
+// 「這天有公司行動」的**偵測**，與「算得出比率」的**量化**是兩件事。
+// 判準刻意與掃描端的 officialUnresolved（resolveCorporateActionAdjustments）一致：
+// 同一筆事件不該在看板上被正確還原、在驗證裡卻被當成沒事發生。
+function swingVerificationActionDetected(code, day, row) {
+  if (corporateActionHistoryForCode(code, day, day).length) return "官方公告";
+  // 上市的 X 標記涵蓋全部歷史，但**只有該月計算結果表真的抓成功過**才算數——
+  // 否則是我們沒查到，不是資料不完整，不該因為上游打嗝就讓驗證單全部停擺。
+  if (row?.exchangeCorporateActionMark && corporateActionResultMonthCovered(day)) return "上市除權息標記";
+  return "";
+}
+
+function applySwingCorporateAction(entry, ratio, day) {
+  entry.entry = roundTo(entry.entry * ratio);
+  entry.stop = roundTo(entry.stop * ratio);
+  entry.target = roundTo(entry.target * ratio);
+  const adjustments = Array.isArray(entry.corporateActions) ? entry.corporateActions : [];
+  adjustments.push({ date: day, ratio: roundTo(ratio, 6) });
+  entry.corporateActions = adjustments.slice(-8);
 }
 
 // 依實際交易日逐根重放。任何中間日缺 K 都停在缺口之前，絕不拿較晚一天替代；
@@ -8624,12 +10181,23 @@ function replaySwingVerificationHistory(entry, dayQuotes, latestDate, calendar =
   if (!entry || entry.status !== "pending") return { changed: false, missingDate: "" };
   const latest = toCompactDate(latestDate);
   if (!latest || latest <= toCompactDate(entry.lastChecked)) return { changed: false, missingDate: "" };
-  const rows = (Array.isArray(dayQuotes) ? dayQuotes : [])
+  // 同一天可能同時來自兩個來源：advanceSwingVerification 直接把「官方逐檔月歷史」與
+  // 「整批收盤」接成 [...history, ...directRows]，中間沒有去重，而官方當月歷史在收盤後
+  // 就會長出當日 K。不先收斂成「每天一列」的話，下面用「陣列前一格」找前一交易日時會抓到
+  // 同一天的另一列，把當日漲跌幅算成公司行動比率，把 entry／停損／目標整組乘上假比率並落盤。
+  // 後到的整批收盤優先，與原本 byDate（Map 後者覆蓋前者）的語意一致。
+  const sortedRows = (Array.isArray(dayQuotes) ? dayQuotes : [])
     .map(normalizeSwingVerificationQuote)
     .filter(Boolean)
     .sort((a, b) => a.rawDate.localeCompare(b.rawDate));
-  const byDate = new Map(rows.map((row) => [row.rawDate, row]));
-  const candidateDays = [...byDate.keys()];
+  const byDate = new Map();
+  for (const row of sortedRows) {
+    const previous = byDate.get(row.rawDate);
+    byDate.set(row.rawDate, previous ? mergeSwingVerificationQuote(previous, row) : row);
+  }
+  const candidateDays = [...byDate.keys()].sort();
+  const rows = candidateDays.map((date) => byDate.get(date));
+  const indexByDate = new Map(candidateDays.map((date, index) => [date, index]));
   let changed = false;
   for (let step = 0; step < 90 && entry.status === "pending"; step += 1) {
     const resolution = resolveNextTradingDate(entry.lastChecked, {
@@ -8640,6 +10208,50 @@ function replaySwingVerificationHistory(entry, dayQuotes, latestDate, calendar =
     const expected = toCompactDate(resolution.date);
     if (!expected || expected > latest) break;
     const row = byDate.get(expected);
+    // 判定觸價之前先把公司行動的機械性跳空吸收掉，否則除權息當天必然誤判成停損。
+    if (row) {
+      const rowIndex = indexByDate.get(expected) ?? -1;
+      const previousRow = rowIndex > 0 ? rows[rowIndex - 1] : null;
+      // 只有「真的相鄰」的兩根才能拿來推公司行動。逐月歷史抓取失敗會被 .catch(() => []) 吞成
+      // 空陣列，缺口前後被直接接起來之後，兩根之間隔了幾週的正常漲跌本來就對不上「昨收」，
+      // 硬算會把整段漲跌記成一次巨大的公司行動（實測：收平盤的股票被記成 −20% 停損）。
+      const gapDays = previousRow ? compactDaysDiff(previousRow.rawDate, expected) : null;
+      const adjacent = gapDays !== null && gapDays >= 1 && gapDays <= HEURISTIC_MAX_GAP_DAYS;
+      // 官方計算結果表優先：上市在除權息日的漲跌價差欄被遮成 "X0.00"，交易所昨收因此是 null，
+      // 只靠昨收比值推比率其實**只有上櫃有效**（2026-07-26 實測）。也就是說這道除權息保護
+      // 過去對上市股票從來沒有生效過，除息當天照樣被記成假停損。
+      // 計算結果表給的是絕對的「前收盤價／參考價」配對，不依賴相鄰列，所以不需要相鄰性檢查。
+      const resultRatio = corporateActionResultRatio(entry.code, expected);
+      const quantification = resultRatio !== null
+        ? { quantified: true, ratio: Math.abs(resultRatio - 1) > CORPORATE_ACTION_RATIO_TOLERANCE ? resultRatio : null }
+        : swingVerificationActionRatio(row, previousRow, { adjacent });
+      // 同一個事件日只能調整一次。推進失敗（當天無成交、高低價缺值）會停在同一個 expected，
+      // 下一輪重跑時若不擋，計畫價會被同一筆事件乘第二次——停等機制會讓重跑變常態，必須先擋。
+      const alreadyApplied = (entry.corporateActions || []).some((item) => item?.date === expected);
+      if (quantification.ratio !== null && !alreadyApplied) {
+        applySwingCorporateAction(entry, quantification.ratio, expected);
+      }
+      // 量不出比率時再問「到底有沒有事件」。有事件卻量不出來 → 停等，不可拿事件前的計畫價
+      // 去比事件後的價格。這是自癒狀態不是錯誤：TWT49U 約 T+1 發布、官方逐檔歷史收盤後補齊，
+      // 通常隔天就解開，而 daysHeld 不會遞增，所以 15 個交易日的觀察窗不會被停等吃掉。
+      const holdReason = quantification.quantified
+        ? ""
+        : swingVerificationActionDetected(entry.code, expected, row);
+      if (holdReason) {
+        const hold = { from: expected, reason: holdReason, detectedAt: new Date().toISOString() };
+        const previous = entry.corporateActionPending;
+        if (!previous || previous.from !== hold.from || previous.reason !== hold.reason) {
+          entry.corporateActionPending = hold;
+          changed = true;
+        }
+        // 刻意不寫 dataGap：那個欄位的語意是「官方日 K 缺漏」，兩者的處理方式與揭露文字都不同。
+        return { changed, missingDate: "" };
+      }
+      if (entry.corporateActionPending) {
+        delete entry.corporateActionPending;
+        changed = true;
+      }
+    }
     if (!row || !advanceSwingVerificationEntry(entry, row)) {
       const nextGap = { from: expected, through: latest, detectedAt: new Date().toISOString() };
       const previous = entry.dataGap;
@@ -8658,6 +10270,12 @@ function replaySwingVerificationHistory(entry, dayQuotes, latestDate, calendar =
 // 每個完整收盤日只跑一次；缺中間日 K 會留 dataGap，下一次重試而不是跳日。
 let lastSwingAdvanceKey = "";
 let swingVerifySummaryCache = { expiresAt: 0, value: null };
+// 摘要有 10 分鐘快取，任何改動驗證單的路徑都必須讓它失效。抽成具名函式的理由：
+// 原本兩處各自寫字面值，測試又沒有正當的把手，於是「只有第一個呼叫者拿到新鮮結果」
+// 這種順序耦合會靜靜潛伏在測試裡（實測：加新案例時才發現舊案例其實靠排在第一個才過）。
+function invalidateSwingVerifySummaryCache() {
+  swingVerifySummaryCache = { expiresAt: 0, value: null };
+}
 async function advanceSwingVerification(reference, latestDate) {
   // 單一市場／last-good／日期未對齊時不可推進，否則同日另一市場稍後補齊也會被節流漏掉。
   if (!latestDate || reference?.coverageComplete === false) return;
@@ -8674,7 +10292,13 @@ async function advanceSwingVerification(reference, latestDate) {
     // replay 可能要 await 多檔歷史；先在 draft 上計算，不能提前修改共享 dbCache。
     const originalStore = cloneJson(db.swingVerification);
     const store = cloneJson(originalStore);
+    // replaySwingVerificationHistory 是同步的，官方除權除息計算結果表要先補齊才查得到。
+    // 驗證單最長留 90 天，抓 4 個月綽綽有餘；一次請求涵蓋全市場，所有 pending 共用。
     const calendar = await getTradingCalendarEvidence();
+    await Promise.all([
+      loadFundamentalsHistory(),
+      ensureCorporateActionResults(compactMonthsBefore(latestDate, 4), latestDate),
+    ]);
     const pendingByCode = new Map();
     for (const entries of Object.values(store)) {
       for (const entry of entries) {
@@ -8716,7 +10340,7 @@ async function advanceSwingVerification(reference, latestDate) {
         return true;
       });
       if (!committed) return;
-      swingVerifySummaryCache = { expiresAt: 0, value: null };
+      invalidateSwingVerifySummaryCache();
     }
     // 只有完整流程成功後才節流；讀檔或寫檔失敗要讓下一次有機會恢復。
     lastSwingAdvanceKey = advanceKey;
@@ -8726,12 +10350,34 @@ async function advanceSwingVerification(reference, latestDate) {
 }
 
 // 各場景統計＋最近結案明細（10 分鐘快取；獨立於 /api/swing——那份 body 會被凍結存快照，不能內嵌會過期的數字）。
+// D-26：驗證單若因官方日 K 缺漏而停在缺口前，會**永遠**留在 pending——`daysHeld` 只在成功推進時
+// 才 +1，所以 15 個交易日超時結案也永遠碰不到；90 天後被 pruneSwingVerification 無差別刪掉，
+// 從頭到尾都沒進過 resolved 分母。健康的 pending 最多 15 個交易日（約 3 週）就會結案，
+// 所以缺口超過 30 個日曆日的視為「卡住」，單獨計數並揭露，讓分母損耗看得見。
+// **刻意不做**「缺 K 就跳到下一個交易日」：stock1-domain 明訂「中間日期缺 K 就停在缺口前，不可跳日」，
+// 那是為了避免「D1 先停損、D2 才達標」被錯記成勝利，屬刻意設計，不能為了衝分母而破壞。
+const SWING_VERIFY_STALLED_DAYS = 30;
+// 兩種停等都會讓 entry 留在原地：缺官方日 K（dataGap）與偵測到公司行動卻量不出比率
+// （corporateActionPending）。前者等資料補齊、後者等官方比率發布，兩者都應該在幾天內自癒；
+// 久到不可能再自行結案時，不論哪一種都是分母損耗，必須一起算進「卡住」。
+function verificationStallFrom(entry) {
+  return entry?.dataGap?.from || entry?.corporateActionPending?.from || "";
+}
+function isStalledVerificationEntry(entry, todayCompact) {
+  if (!entry || entry.status !== "pending") return false;
+  const from = verificationStallFrom(entry);
+  if (!from) return false;
+  const gap = compactDaysDiff(toCompactDate(from), todayCompact);
+  return Number.isFinite(gap) && gap > SWING_VERIFY_STALLED_DAYS;
+}
+
 async function buildSwingVerificationSummary() {
   if (swingVerifySummaryCache.value && swingVerifySummaryCache.expiresAt > Date.now()) {
     return swingVerifySummaryCache.value;
   }
   const db = await loadDb();
   const store = db.swingVerification || {};
+  const summaryToday = toTaipeiCompactDate();
   const byScenario = new Map();
   const all = [];
     const versionCounts = new Map();
@@ -8749,12 +10395,20 @@ async function buildSwingVerificationSummary() {
       if (formulaVersion !== SWING_FORMULA_VERSION) continue;
       const s = byScenario.get(entry.scenario) || {
         scenario: entry.scenario,
-        samples: 0, wins: 0, losses: 0, expired: 0, pending: 0,
+        samples: 0, wins: 0, losses: 0, expired: 0, pending: 0, stalled: 0,
         resolved: 0, sumResultPct: 0, sumDaysHeld: 0,
+        periodicCallSamples: 0, periodicCallResolved: 0,
       };
       s.samples += 1;
+      // D-30：分盤撮合的樣本照舊計入勝率（改口徑要另外決策），但必須數得出來。
+      // 舊紀錄沒有 fillModel 欄位 → 當成 continuous，不追溯改寫歷史樣本。
+      if (entry.fillModel && entry.fillModel !== "continuous") {
+        s.periodicCallSamples += 1;
+        if (entry.status !== "pending") s.periodicCallResolved += 1;
+      }
       if (entry.status === "pending") {
         s.pending += 1;
+        if (isStalledVerificationEntry(entry, summaryToday)) s.stalled += 1;
       } else {
         s.resolved += 1;
         s.sumResultPct += entry.resultPct || 0;
@@ -8774,9 +10428,17 @@ async function buildSwingVerificationSummary() {
     losses: s.losses,
     expired: s.expired,
     pending: s.pending,
-    winRate: s.resolved ? Math.round((s.wins / s.resolved) * 1000) / 10 : null,
+    stalled: s.stalled,
+    resolved: s.resolved,
+    // 低於最小樣本時回 null——不是「沒有資料」，而是「還不足以當成結論」。
+    winRate: s.resolved >= WIN_RATE_MIN_SAMPLES ? Math.round((s.wins / s.resolved) * 1000) / 10 : null,
+    winRateMinSamples: WIN_RATE_MIN_SAMPLES,
     avgResultPct: s.resolved ? Math.round((s.sumResultPct / s.resolved) * 100) / 100 : null,
+    avgResultPctNet: s.resolved ? netReturnPct(s.sumResultPct / s.resolved) : null,
     avgDaysHeld: s.resolved ? Math.round((s.sumDaysHeld / s.resolved) * 10) / 10 : null,
+    // 分盤撮合（處置期間）的樣本數：仍計入上面的勝率，但要能單獨看見。
+    periodicCallSamples: s.periodicCallSamples,
+    periodicCallResolved: s.periodicCallResolved,
   }));
   all.sort((a, b) => String(b.resolvedAt || b.day).localeCompare(String(a.resolvedAt || a.day)));
   const body = {
@@ -8788,9 +10450,21 @@ async function buildSwingVerificationSummary() {
     recent: all.filter((entry) => entry.status !== "pending").slice(0, 20),
     pendingCount: all.filter((entry) => entry.status === "pending").length,
     dataGapCount: all.filter((entry) => entry.status === "pending" && entry.dataGap).length,
+    // 偵測到公司行動卻還算不出官方比率而停等的張數。它是自癒的暫時狀態（通常隔天解開），
+    // 但必須數得出來——否則「今天沒有推進」看起來會和「今天沒有變化」一模一樣。
+    corporateActionPendingCount: all.filter((entry) => entry.status === "pending" && entry.corporateActionPending).length,
+    // 卡住＝資料缺口久到不可能再自行結案；它們永遠不會進 resolved 分母，必須讓使用者看得到。
+    stalledCount: all.filter((entry) => isStalledVerificationEntry(entry, summaryToday)).length,
+    // D-30：處置期間是分盤集合競價，觸價判定的前提（連續競價）在這些樣本上並不成立。
+    periodicCallCount: all.filter((entry) => entry.fillModel && entry.fillModel !== "continuous").length,
     notes: [
       "驗證規則：進場＝訊號日收盤，之後每個交易日用官方日K高低價判定「先碰目標＝達標、先碰停損（結構停損）＝停損」；同一天兩邊都碰到，保守記停損。",
       `${SWING_VERIFY_MAX_DAYS} 個實際交易日內都沒碰到 → 以第 ${SWING_VERIFY_MAX_DAYS} 日收盤結案（超時）。漏開 App 會用官方日K依日期補判；若中間日K缺漏就停在缺口前並排除結案統計。`,
+      `勝率需累積 ${WIN_RATE_MIN_SAMPLES} 筆結案才顯示：分母只含已結案，而達標／停損常 1~3 天就結案、超時要等第 ${SWING_VERIFY_MAX_DAYS} 個交易日，初期分母偏向快速觸價的極端樣本。同一天選出的標的也高度共享大盤走勢，有效樣本數遠小於檔數。`,
+      `因官方日 K 缺漏而停在缺口前超過 ${SWING_VERIFY_STALLED_DAYS} 天的驗證單會標為「卡住」：它們不會自行結案，也永遠不會進入勝率分母，因此分母會比實際發出的訊號數少。`,
+      "除權息／減資當天，若交易所公告說有事件但官方比率還沒發布（計算結果表約次一營業日才有），該張驗證單會暫停推進而不是拿事件前的進場／停損／目標去比事件後的價格——否則除息當天必然被記成假停損。等比率到齊後會自動接著判，觀察天數不會被停等吃掉。",
+      "處置期間的標的是分盤集合競價（每 5 或 20 分鐘撮合一次），日 K 的最高／最低價只是幾十次撮合的極值，掛在停損／目標的單未必真的撮得到。這些樣本仍計入上面的勝率，但會單獨標示筆數；2026-07-27 之前建立的驗證單沒有記錄撮合方式，一律當成連續競價。",
+      `所有百分比預設為未扣費稅的毛報酬；${VERIFY_COST_NOTE}`,
     ],
   };
   swingVerifySummaryCache = { expiresAt: Date.now() + 10 * 60 * 1000, value: body };
@@ -8800,10 +10474,14 @@ async function buildSwingVerificationSummary() {
 // 實際掃描全市場（重）：抓歷史、算特徵、分類、產生交易計畫與評分。
 async function scanSwingBoard(reference, latestDate, scenarioKey, maxCandidates) {
   // 權息預告一旦過日就離開上游滾動窗；掃描前先刷新並落盤，讓同一輪 K 線可用官方參考價還原。
-  const [riskSets] = await Promise.all([
+  // 官方除權除息計算結果表則是逐月、一次涵蓋全市場，所以在這裡補一次就夠整輪 240 檔共用。
+  // 補齊範圍看的是「歷史最遠可能退到哪」而不是「正常抓幾個月」：下面 getStockHistory 開了
+  // fallbackRange "1y"，被限流時整包會變成 Yahoo 的一年序列（見 CORPORATE_ACTION_RESULT_FALLBACK_MONTHS）。
+  const scanFromDate = compactMonthsBefore(latestDate, CORPORATE_ACTION_RESULT_FALLBACK_MONTHS);
+  const [riskSets, , corporateActionCoverage] = await Promise.all([
     getRiskSets(latestDate),
     getDividendSchedule(),
-    loadFundamentalsHistory(),
+    loadFundamentalsHistory().then(() => ensureCorporateActionResults(scanFromDate, latestDate)),
   ]);
   const candidates = preselectSwingQuotes(reference, riskSets, latestDate, maxCandidates);
   // 同時抓取數再調低（5→3）：當月逐檔 K 在高並發下最容易被證交所限流而退回前一交易日，
@@ -8838,7 +10516,9 @@ async function scanSwingBoard(reference, latestDate, scenarioKey, maxCandidates)
       }
       const plan = buildSwingPlan(features);
       // 盈虧比下限：風險>報酬的設定不值得做，直接剔除（也自然淘汰離中軌過遠→停損遠→RR 爛的股）。
-      if (!Number.isFinite(plan.rr) || plan.rr < SWING_MIN_RR) {
+      // 用**淨** RR 把關：門檻宣稱「風險大於報酬的設定不值得做」，那就得算進來回成本，
+      // 否則毛 RR 1.0~1.2 這一段全部是「看起來剛好過關、實際上賠錢」（見 buildSwingPlan 的說明）。
+      if (!Number.isFinite(plan.rrNet) || plan.rrNet < SWING_MIN_RR) {
         return { hits: [], pick: null, outcome: "rr-filtered", historySuccess: true, freshHistory: true, featureReady: true };
       }
       // 對「所有場景」分類做命中計數：讓分頁能同時顯示兩個場景今天各有幾檔（兩場景互斥、理論上不重疊）。
@@ -8879,7 +10559,14 @@ async function scanSwingBoard(reference, latestDate, scenarioKey, maxCandidates)
       .forEach((pick, index) => picks.push({ ...pick, rank: index + 1 }));
   }
   // 注意/處置/變更交易股保留並標示（前端可切換隱藏）。
-  for (const pick of picks) pick.surveillance = riskSets.surveillance.get(pick.code) || null;
+  // 另外把處置看板知道的分盤間隔補進來（riskSets 只有 kind/label）——驗證單要靠它記錄
+  // 當時的撮合方式（D-30）。看板沒熱時拿不到間隔，那就只知道「處置中」而不知道是幾分盤。
+  for (const pick of picks) {
+    const info = riskSets.surveillance.get(pick.code) || null;
+    if (!info) { pick.surveillance = null; continue; }
+    const interval = lookupStockSurveillance(pick.code, surveillanceBoardCache.value)?.interval ?? null;
+    pick.surveillance = interval ? { ...info, interval } : info;
+  }
 
   // 各場景命中數：同一次掃描已對每檔跑過所有場景偵測，兩個分頁的數字都來自這一份、保證一致。
   const scenarioCounts = {};
@@ -8912,11 +10599,21 @@ async function scanSwingBoard(reference, latestDate, scenarioKey, maxCandidates)
     failureReasons,
     coverageRate: roundTo(coverageRate * 100),
     reliable: scanReliable,
+    // 官方除權除息計算結果表這一輪有沒有抓齊。抓不到不會讓掃描失敗（會退回歸檔公告與跳空估算），
+    // 但那代表這批均線／布林／MACD 可能建立在沒還原的價格上——這件事必須看得見。
+    // 這個失敗模式在開發期間三天內出現三次（證交所限流），而且畫面上完全沒有跡象。
+    corporateActionResultsComplete: !corporateActionCoverage?.degraded,
   };
   const provisional = !reference.coverageComplete || !scanReliable;
   const scanWarnings = scanReliable
     ? []
     : [`本次只有 ${freshHistoryCount}/${candidates.length} 檔候選取得 ${compactToSlashDate(latestDate)} 的新鮮歷史，結果暫時顯示但不會寫入正式快照。`];
+  // 還原權息的第一順位來源沒抓齊時一定要說。這一輪的均線／布林／MACD 可能建立在
+  // 沒還原的價格上，而畫面上不會有任何其他跡象——刻意不擋掉結果（歸檔公告與跳空估算仍在），
+  // 但使用者要知道這批數字的基礎比平常弱。已抓到的月份會落盤，下一輪通常就補齊了。
+  if (corporateActionCoverage?.degraded) {
+    scanWarnings.push("官方除權除息計算結果表這一輪有部分月份沒抓到，這批標的的還原權息改用公告公式或跳空估算，均線與布林可能不夠精確；資料會在下一輪補齊。");
+  }
 
   return {
     ok: true,
@@ -9068,6 +10765,18 @@ async function inspectSwingStock(rawCode) {
     return { ok: false, error: `找不到「${query}」（請輸入上市櫃普通股的代碼或股名，例：2330 或 台積電）` };
   }
 
+  // 波段引擎的 10.5% 跳空 heuristic 前提是「台股有 ±10% 漲跌幅限制」，只對普通股成立。
+  // 國外成分／槓桿反向 ETF 無漲跌幅限制，任何一天的真實大漲都會被追認成公司行動，
+  // 該日以前的歷史全被乘上假比率，MA／布林／MACD 一起錯，前端還會顯示不存在的權息事件。
+  // 掃描端本來就有 isOrdinaryStock 過濾，健檢是使用者手打代碼的入口，補上同一道門檻。
+  if (!isOrdinaryStock(quote)) {
+    return {
+      ok: false,
+      error: `波段型態健檢只支援上市櫃普通股；「${quote.name || quote.code}」是 ETF／權證等商品，`
+        + "其漲跌幅限制與還原權息規則不同，套用同一套型態判讀會失真。",
+    };
+  }
+
   // latestDate：與 buildSwingBoard 一致，取「最多個股共有的官方收盤日」眾數。
   const latestDate = resolveMarketCloseDate(reference);
 
@@ -9081,6 +10790,8 @@ async function inspectSwingStock(rawCode) {
   history = appendTodayCloseBar(history, quote, latestDate);
   const rows = addPreviousClose(history)
     .filter((row) => [row.open, row.high, row.low, row.close].every(Number.isFinite));
+  // 同步的 resolveCorporateActionAdjustments 要查交易所計算結果表，得先把月份補齊。
+  const resultCoverage = await ensureCorporateActionResults(rows[0]?.date, rows.at(-1)?.date);
   const officialActions = corporateActionHistoryForCode(quote.code, rows[0]?.date, rows.at(-1)?.date);
   const features = computeSwingFeatures(rows, officialActions, { allowHeuristicFallback: true });
   if (!features) {
@@ -9153,10 +10864,20 @@ async function inspectSwingStock(rawCode) {
     score: roundTo(scoreSwing(features, plan, verdict.key || "midBandDefense")),
     verdict,
     scenarios,
-    warnings: reference.warnings || [],
+    // 掃描（scanQuality）、隔日沖（warnings）、技術頁（corporateActions.notes）都會揭露還原
+    // 來源的降級，健檢原本是唯一漏掉的入口——而且 corporateActionResultMonthCovered 刻意讓
+    // 「上游抓不到」不算未定案（否則會誤剔一批大型股），所以降級時上面那道
+    // corporateActionUnresolved 擋門不會觸發，結果會以完全正常的樣子端出去。
+    warnings: unique([
+      ...(reference.warnings || []),
+      ...(resultCoverage.degraded
+        ? ["官方除權除息計算結果表這一輪沒抓齊，這檔的還原改用公告公式或跳空估算，均線與布林可能不夠精確。"]
+        : []),
+    ]),
     dataQuality: {
       degraded: Boolean(reference.degraded),
       referenceComplete: Boolean(reference.coverageComplete),
+      corporateActionResultsComplete: !resultCoverage.degraded,
       markets: reference.markets,
     },
     disclaimer: "本功能只做技術型態檢測，提供進出參考價位，不是買賣建議，也不保證獲利。",
@@ -9649,7 +11370,7 @@ async function handleApi(request, requestUrl, response) {
       return true;
     }
     const rawCode = String(requestUrl.searchParams.get("code") || "").trim().toUpperCase();
-    if (!/^[0-9A-Z]{4,6}$/.test(rawCode)) {
+    if (!SECURITY_CODE_PATTERN.test(rawCode)) {
       jsonResponse(response, 400, { ok: false, error: "證券代號必須是 4～6 碼英數字" });
       return true;
     }
@@ -9681,6 +11402,8 @@ async function handleApi(request, requestUrl, response) {
         rev: getDataRev(db, auth.user.id, "trades"),
         ...payload,
         portfolio: buildPortfolio(payload),
+        // 官方歸檔裡有、但帳本沒登錄的除權／現增；前端據此提供事後補登。
+        missingCorporateActions: await findMissingCorporateActions(payload),
       });
       return true;
     }
@@ -10945,7 +12668,7 @@ export {
   cleanCode, parseNumber, parsePercentNumber, unique, average, pct,
   // 行情正規化（quote-normalizers.test）
   normalizeDailyTwse, normalizeDailyTpex, normalizeMisQuote, normalizeFubonQuote,
-  normalizeTaiexIndex, normalizeTxFuture, normalizeTaifexMisTx, taifexContractMonthLabel,
+  normalizeTaiexIndex, normalizeTxFuture, applyCorporateActionQuoteBaseline, normalizeTaifexMisTx, taifexContractMonthLabel,
   computeTurnoverPct, isOrdinaryStock, resolveIndustryName, normalizeWatchListsPayload,
   getReferenceData, getQuotes, fetchMisQuotes,
   // 市場摘要（market-summary.test）
@@ -10959,7 +12682,7 @@ export {
   getTradingCalendarEvidence, getOfficialObservationEvidence, observeSignalSnapshot,
   buildSignalVerification, buildVerificationHistory,
   // 週/月K 聚合與波段日期 helper（history-aggregate.test）
-  aggregateHistoryByPeriod, getWeekKey, addPreviousClose, resolveMarketCloseDate, appendTodayCloseBar, fetchStockHistoryMonth,
+  aggregateHistoryByPeriod, getWeekKey, addPreviousClose, resolveMarketCloseDate, appendTodayCloseBar, fetchStockHistoryMonth, getStockHistory,
   // 法人／融資券（institutional-margin.test）
   normalizeTwseInstitutionalRow, normalizeTpexInstitutionalRow,
   normalizeTwseMarginRow, normalizeTpexMarginRow, getInstitutionalData, getMarginData,
@@ -10974,30 +12697,44 @@ export {
   // 持股損益
   TRADE_SCHEMA_VERSION, MAX_TRADE_RECORDS, isValidCompactCalendarDate, validateTradesMutationInput,
   computeTradeFee, computeTradeTax, computeTradeTaxRule,
-  normalizeTradesPayloadLegacy, normalizeTradesPayload, migrateTradesPayloadToV2, buildPortfolio,
+  normalizeTradesPayload, migrateTradesPayloadToV2, buildPortfolio, sharesHeldBeforeExDate,
   // 官方商品主檔／交易商品 provenance
   PRODUCT_DIRECTORY_RULE_VERSION, classifyOfficialEtf,
   parseTwseEtfDirectorySnapshot, parseTpexEtfCategory, parseTpexEtfDirectorySnapshot,
   getProductDirectory, resolveOfficialInstruments, canonicalizeTradeInstrumentProvenance,
   tradeMoneyEstimateFingerprint, canonicalizeTradeMoneyProvenance,
   // 處置／監視
-  SURVEILLANCE_RANK, classifySurveillance, parseDispositionPeriod, parseDispositionInterval,
-  lookupStockSurveillance, survFetchRecords, getSurveillanceBoard, getRiskSets,
+  SURVEILLANCE_RANK, classifySurveillance, parseDispositionPeriod, parseDispositionInterval, latestUpstreamDate,
+  VERIFY_ROUND_TRIP_COST_PCT, VERIFY_COST_NOTE, netReturnPct,
+  findMissingCorporateActions, corporateActionErrors, TRADE_CORPORATE_ACTION_SIDE,
+  WIN_RATE_MIN_SAMPLES,
+  lookupStockSurveillance, survFetchRecords, getSurveillanceBoard, getRiskSets, twseNoticeRowsOrNull,
   // 技術分析數學
   emaSeries, movingAverageSeries, computeMacd, findSwingPoints, buildTrendLine,
   buildFibonacci, buildTechnicalSignals, averageTrueRange, buildTechnicalAnalysis,
+  buildAdjustedPeriodRows, resolveCorporateActionAdjustments,
+  parseYahooSplitFactors, normalizeYahooHistoryRows,
   // 隔日沖／波段評分
-  buildPick, buildRiskTags, buildReasons, corporateActionGapRatio, officialCorporateActionRatio,
+  buildPick, buildRiskTags, buildReasons, corporateActionGapRatio, officialCorporateActionRatio, plausibleShareFactor,
   backAdjustForCorporateActions, computeSwingFeatures, classifySwingScenario,
   SWING_FORMULA_VERSION, stockTickSize, roundToStockTick,
   buildSwingPlan, scoreSwing, buildSwingPick, preselectQuotes, preselectSwingQuotes,
+  stockLimitUpPrice, isLimitUpLockedBar,
   scanSwingBoard, inspectSwingStock,
   // 波段前向驗證
-  recordSwingVerification, advanceSwingVerificationEntry, replaySwingVerificationHistory, advanceSwingVerification,
-  buildSwingVerificationSummary, pruneSwingVerification,
+  recordSwingVerification, swingVerificationFillModel, advanceSwingVerificationEntry, replaySwingVerificationHistory, advanceSwingVerification,
+  buildSwingVerificationSummary, invalidateSwingVerifySummaryCache, pruneSwingVerification,
   // 基本面
   rocYearMonthToIso, getMonthlyRevenue, getQuarterlyEps, getValuations, getDividendSchedule,
-  corporateActionHistoryForCode,
+  normalizeDividendMarketRows, DIVIDEND_RATIO_MAX_PLAUSIBLE, appendDividendHistory,
+  DIVIDEND_HISTORY_MAX_EVENTS_PER_CODE,
+  // replaySwingVerificationHistory 是同步的，公司行動偵測要讀已載入的歸檔；
+  // 生產路徑由 advanceSwingVerification 先 await，測試也必須照同一個順序來，
+  // 否則偵測器會安靜地讀到空歸檔、把「沒載入」當成「沒有事件」。
+  loadFundamentalsHistory, corporateActionHistoryForCode,
+  normalizeCorporateActionResultRows, loadCorporateActionResultMonth, ensureCorporateActionResults,
+  corporateActionResultMonthUsable, corporateActionResultPayloadRows, corporateActionResultMonthCovered, CORPORATE_ACTION_RESULT_MAX_MONTHS,
+  corporateActionResultFor, corporateActionResultRatio, CORPORATE_ACTION_RESULT_URL,
   peekDividendSchedule, getCompanyDirectory, getIssuedShares, getCompanyMeta, buildFundamentals,
   // 伺服器
   server, startServer, shutdownServer,

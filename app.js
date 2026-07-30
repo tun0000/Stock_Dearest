@@ -328,6 +328,10 @@ const dataState = {
   quoteCount: 0,
   realtimeCount: 0,
   fallbackCount: 0,
+  // 後端 /api/quotes 會回「上市與上櫃整批收盤資料日尚未對齊」「沿用 last-good」等 warnings，
+  // 隔日沖與策略雷達都有渲染，唯獨主報價畫面以前連欄位都沒有 → 使用者不知道自己在看舊價。
+  warnings: [],
+  degraded: false,
   error: "",
   loadedOnce: false,
 };
@@ -702,7 +706,7 @@ function buildIndicatorDetail(stock) {
           { label: "自營商", value: formatShareLots(institutional.dealerNet), tone: toneFromNet(institutional.dealerNet) },
           { label: "法人合計", value: formatShareLots(institutional.totalNet), tone: toneFromNet(institutional.totalNet) },
         ],
-        note: `來源：${institutionalSource}。自營商合計包含自行買賣與避險；外資採官方外陸資買賣超口徑。`,
+        note: `來源：${institutionalSource}。自營商合計包含自行買賣與避險；外資採官方外陸資買賣超口徑（不含外資自營商）。${formatForeignDealerReconcile(institutional)}`,
       }
     : {
         title: "法人籌碼",
@@ -829,7 +833,6 @@ const el = {
   watchSelectVisible: document.getElementById("watchSelectVisible"),
   watchClearSelection: document.getElementById("watchClearSelection"),
   detailPanel: document.getElementById("detailPanel"),
-  detailClose: document.getElementById("detailClose"),
   searchModal: document.getElementById("searchModal"),
   searchInput: document.getElementById("searchInput"),
   searchResults: document.getElementById("searchResults"),
@@ -885,7 +888,11 @@ function formatNumber(value, maxFractionDigits = 2) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   const digits = Math.max(0, Math.min(8, Math.round(Number(maxFractionDigits) || 0)));
-  return Number.isInteger(number) ? number.toString() : number.toFixed(digits).replace(/\.?0+$/, "");
+  if (Number.isInteger(number)) return number.toString();
+  // 只在有小數點時去尾零：digits=0 時 toFixed 會回整數字串（1049.6 → "1050"），
+  // 直接套 /\.?0+$/ 會把它砍成 "105"。與 formatTechnicalValue 用同一道防線。
+  const text = number.toFixed(digits);
+  return text.includes(".") ? text.replace(/\.?0+$/, "") : text;
 }
 
 // Number(null) 會變成 0；行情合併與顯示不能因此捏造「0 元／0 張」。
@@ -935,6 +942,21 @@ function signedDirection(value) {
 function toneFromNet(value) {
   const direction = signedDirection(value);
   return direction > 0 ? "positive" : direction < 0 ? "negative" : "muted";
+}
+
+// 明細面板欄位的語意色。舊寫法的 tone 不是語意而是「調色盤第幾格」——四個分頁一律
+// neutral→high→low→volume→total 固定輪轉，於是投信買賣超永遠紅、自營永遠綠、
+// 營收 YoY 的 ▼ 是紅色的（符號說跌、顏色說漲，直接互相打臉）。
+//
+// 分辨規則：
+//   有正負的「變化量／流量」（買賣超、YoY、價與均線的差）→ 走台股紅漲綠跌。
+//   沒有正負的「水準值」（開高低、均價、量、本益比、殖利率）→ 不上色，語意由 label 承擔。
+//   無值／未揭露 → is-na 灰，不進紅綠。
+// 平盤門檻沿用既有的 signedDirection（|值| < 0.005），不新增任何門檻。
+function metricToneFromNet(value) {
+  if (finiteNumberOrNull(value) === null) return "na";
+  const direction = signedDirection(value);
+  return direction > 0 ? "up" : direction < 0 ? "down" : "flat";
 }
 
 function signalFromChange(value) {
@@ -1118,9 +1140,16 @@ function renderBacktestChips(backtest) {
       </span>
     `;
   }
-  const hitRate = backtest?.hitPlus2Rate === null || backtest?.hitPlus2Rate === undefined
-    ? "資料不足"
-    : formatOptionalPercent(backtest.hitPlus2Rate * 100);
+  // 個股回測的樣本是「這檔在回測窗內觸發訊號的次數」，常常只有一兩次。
+  // 1 次觸發算出的「+2 達成率 100%」沒有統計意義，卻跟累積多次的數字長得一樣。
+  // 這裡的門檻用 5（比場景勝率的 20 寬鬆）——它是個股層級的參考提示，不是策略結論；
+  // 次數本身照樣顯示，讓使用者自己看得到樣本有多小。
+  const RATE_MIN_SAMPLES = 5;
+  const hitRate = sample < RATE_MIN_SAMPLES
+    ? "樣本不足"
+    : backtest?.hitPlus2Rate === null || backtest?.hitPlus2Rate === undefined
+      ? "資料不足"
+      : formatOptionalPercent(backtest.hitPlus2Rate * 100);
   const avgClose = backtest?.avgCloseReturn === null || backtest?.avgCloseReturn === undefined
     ? "資料不足"
     : formatOptionalPercent(backtest.avgCloseReturn);
@@ -1189,8 +1218,31 @@ function getOvernightTopPick(groupKey) {
 function getDataTrustTone() {
   if (dataState.error || marketState.error || sourceState.error) return "warn";
   if (getSelectedSource() === "broker") return isBrokerSourceReady() ? "good" : "warn";
+  // 後端已明說資料降級（例如兩市場收盤日未對齊、沿用 last-good）時不能還顯示「資料正常」。
+  if (dataState.degraded || dataState.warnings.length) return "mixed";
   if (dataState.fallbackCount > 0) return "mixed";
   return "good";
+}
+
+// D-20：驗證與回測的百分比預設是「未扣費稅的毛報酬」。台股一買一賣約 0.471%，
+// 而隔日沖的平均報酬本來就在 ±0.5% 這個量級——毛值 +0.35% 扣完成本其實是 −0.12%，
+// 正負號會翻轉。這裡不動使用者熟悉的毛值，改成在旁邊並陳伺服器算好的淨值。
+function formatGrossWithNet(grossPct, netPct) {
+  const gross = formatSignedPercent(grossPct);
+  // 這裡不能用 Number.isFinite(Number(netPct))：Number(null)===0 是有限值，
+  // 缺值會被渲染成「淨 +0.00%」——正是全站一直在防的造假零。走既有的 finiteNumberOrNull。
+  const net = finiteNumberOrNull(netPct);
+  if (net === null) return gross;
+  return `${gross}<em class="verify-net" title="已扣一買一賣的手續費與證交稅估算（約 0.471%）">淨 ${formatSignedPercent(net)}</em>`;
+}
+
+// D-32：官方 T86 的「三大法人合計」含外資自營商，而畫面上的外資欄是「外陸資」（不含它），
+// 所以外資＋投信＋自營商永遠比合計少一個外資自營商——實測 5000+1000+500=6500 vs 官方合計 6600。
+// 數字一律維持官方定義不動（改成合併口徑需要對市場慣用定義下斷言，不做），改成把差額講明白。
+function formatForeignDealerReconcile(institutional) {
+  const dealerNet = finiteNumberOrNull(institutional?.foreignDealerNet);
+  if (dealerNet === null) return "";
+  return `法人合計另含外資自營商 ${formatShareLots(dealerNet)}，因此不等於上方三格相加。`;
 }
 
 function renderDataTrustCompact() {
@@ -1209,12 +1261,20 @@ function renderDataTrustCompact() {
     : isBrokerSourceReady()
       ? "券商行情已設定"
       : "券商未設定，會回官方資料";
+  // 後端明講的降級原因（兩市場收盤日未對齊、沿用 last-good…）以前只留在 payload 裡沒人顯示。
+  // 這是使用者判斷「現在看到的數字能不能信」的關鍵，最多列兩條避免洗版，其餘用 title 補。
+  const warnings = dataState.warnings || [];
+  const warningText = warnings.slice(0, 2).join("；");
+  const warningHtml = warnings.length
+    ? `<small class="data-trust-warning" title="${escapeHtml(warnings.join("\n"))}">${escapeHtml(warningText)}${warnings.length > 2 ? `（另有 ${warnings.length - 2} 則）` : ""}</small>`
+    : "";
   return `
     <aside class="data-trust-card is-${tone}">
       <span>資料可信度</span>
       <strong>${escapeHtml(toneText)}</strong>
       <p>${escapeHtml(sourceLabel)} / 更新 ${escapeHtml(updated)}</p>
       <small>${escapeHtml(detail)}</small>
+      ${warningHtml}
     </aside>
   `;
 }
@@ -1264,7 +1324,7 @@ function renderTodayFocusPanel() {
           <span>自選股</span>
           <strong>${watchStats.upCount} 漲 / ${watchStats.downCount} 跌</strong>
           <p>平均 ${formatSignedPercent(watchStats.avgChange)}，強波動 ${watchStats.activeCount} 檔。</p>
-          <small class="${watchTone}">${strongestWatch ? `最新交易日最強：${strongestWatch.name} ${strongestWatch.changeText}` : "尚無自選股"}</small>
+          <small class="${watchTone}">${strongestWatch ? `最新交易日最強：${escapeHtml(strongestWatch.name)} ${escapeHtml(strongestWatch.changeText)}` : "尚無自選股"}</small>
         </article>
         ${renderDataTrustCompact()}
       </div>
@@ -1990,6 +2050,7 @@ function clearUserScopedState({ renderNow = true } = {}) {
   tradesState.records = [];
   tradesState.quarantinedRecords = [];
   tradesState.portfolio = null;
+  tradesState.missingCorporateActions = [];
   tradesState.loaded = false;
   tradesState.rev = 0;
   tradesState.mutating = false;
@@ -2384,8 +2445,10 @@ function checkPriceAlerts(eligibleCodes = null, { renderNow = true } = {}) {
     // 行情 loader 會傳入「本輪確實取得即時價」的代號；API 漏回某檔時不可沿用全域舊價誤觸。
     if (eligible && !eligible.has(normalizeStockCodeInput(alert.code))) continue;
     const stock = byCode.get(alert.code);
-    const price = Number(stock?.price);
-    if (!stock || !Number.isFinite(price) || stock.priceStale) continue;
+    // 成交價要走 positivePriceOrNull：Number(null)===0 會讓「無報價」的檔位通過門檻，
+    // 於是任何跌破提醒都會用「現價 0」立刻誤觸發並自我標記已觸發，真正到價時反而不再提醒。
+    const price = positivePriceOrNull(stock?.price);
+    if (!stock || price === null || stock.priceStale) continue;
     const hit = alert.op === "<=" ? price <= alert.price : price >= alert.price;
     if (!hit) continue;
     alert.triggeredAt = new Date().toISOString();
@@ -2710,6 +2773,11 @@ function applyTradesPayload(payload) {
   tradesState.records = Array.isArray(payload.records) ? payload.records : [];
   tradesState.quarantinedRecords = Array.isArray(payload.quarantinedRecords) ? payload.quarantinedRecords : [];
   tradesState.portfolio = payload.portfolio || null;
+  // 官方歸檔有、帳本沒登錄的除權／現增（伺服器比對後回傳）。漏記不只是顯示假虧損，
+  // 之後想賣掉含配股的股數還會被賣超檢查擋下，所以要主動提示補登。
+  tradesState.missingCorporateActions = Array.isArray(payload.missingCorporateActions)
+    ? payload.missingCorporateActions
+    : [];
   if (Number.isFinite(Number(payload.rev))) tradesState.rev = Number(payload.rev);
   tradesState.loaded = true;
 }
@@ -2983,6 +3051,38 @@ function formatMoney(value, { signed = false } = {}) {
 }
 
 // 自選股頁第 4 籤「庫存損益」：總覽＋持股（配即時價算未實現）＋記一筆＋交易紀錄。
+// D-22 補登：官方歸檔有、帳本沒登錄的除權／現增。快速鈕只在除權當天出現，
+// 錯過就沒有入口了——而漏記會讓之後賣出含配股的股數被賣超檢查擋下，所以要能事後補。
+// 比率一律用官方值，使用者不必自己查（手填最容易把「每仟股配股數」當成比率）。
+function renderMissingCorporateActions() {
+  const missing = tradesState.missingCorporateActions || [];
+  if (!missing.length) return "";
+  const rows = missing.map((item) => {
+    const parts = [];
+    if (item.bonusShares > 0) parts.push(`配股 +${Number(item.bonusShares).toLocaleString("zh-TW")} 股`);
+    if (item.subscribedShares > 0) {
+      parts.push(`現增 +${Number(item.subscribedShares).toLocaleString("zh-TW")} 股＠${formatNumber(item.subscriptionPrice)} 元`);
+    }
+    const exDate = String(item.exDate || "");
+    return `
+      <li>
+        <span><strong>${escapeHtml(item.code)}</strong> ${escapeHtml(`${exDate.slice(4, 6)}/${exDate.slice(6, 8)}`)} · ${escapeHtml(parts.join("、"))}</span>
+        <button class="hold-div-quick is-corporate" type="button" data-corporate-action-quick
+          data-code="${escapeHtml(item.code)}" data-ex-date="${escapeHtml(exDate)}"
+          data-stock-ratio="${Number(item.stockRatio) || 0}"
+          data-subscription-ratio="${Number(item.subscriptionRatio) || 0}"
+          data-subscription-price="${Number(item.subscriptionPrice) || 0}"
+          ${tradesState.mutating ? "disabled aria-busy=\"true\"" : ""}>補登</button>
+      </li>`;
+  }).join("");
+  return `
+    <div class="hold-missing-ca">
+      <strong>有 ${missing.length} 筆官方除權／現增尚未登錄</strong>
+      <small>漏記會讓持股股數停在配股前——除了未實現損益失真，之後賣出含配股的股數還會被當成賣超擋下。比率取自官方公告。</small>
+      <ul>${rows}</ul>
+    </div>`;
+}
+
 function renderHoldingsPanel() {
   const panel = el.holdingsPanel;
   if (!panel) return;
@@ -3013,6 +3113,34 @@ function renderHoldingsPanel() {
     .filter(Boolean);
   const quickDividendByCode = new Map(quickDividendCandidates.map((item) => [item.stock.code, item]));
 
+  // D-22：除權（無償配股）當日的快速登錄。帳本原本只認買賣與現金股利，配股後股數永遠停在
+  // 配股前——除了顯示假虧損，更嚴重的是之後想賣掉「含配股」的全部股數會被賣超檢查擋下。
+  // 沿用現金股利快速鈕的同一套模式：只在官方除權基準日當天、且尚未登錄過時出現。
+  const hasCorporateActionRecord = (code, exDate) => tradesState.records.some((record) => record.side === "corporateAction"
+    && record.code === code
+    && String(record.tradeDate || record.date || "") === String(exDate || "").replaceAll("-", ""));
+  const quickCorporateActionByCode = new Map(stocks
+    .map((stock) => {
+      const div = stock?.dividend;
+      const stockRatio = finiteNumberOrNull(div?.stockRatio);
+      if (!div?.isToday || stockRatio === null || stockRatio <= 0) return null;
+      const exDate = String(div.exDate || "").replaceAll("-", "");
+      if (!exDate || !holdingCodes.has(stock.code)) return null;
+      if (hasCorporateActionRecord(stock.code, exDate)) return null;
+      const holding = holdings.find((item) => item.code === stock.code);
+      const bonusShares = Math.floor(Number(holding?.shares || 0) * stockRatio);
+      if (bonusShares <= 0) return null;
+      return { stock, exDate, stockRatio, bonusShares };
+    })
+    .filter(Boolean)
+    .map((item) => [item.stock.code, item]));
+
+  const quickCorporateActionButton = (item) => `
+    <button class="hold-div-quick is-corporate" type="button" data-corporate-action-quick
+      data-code="${item.stock.code}" data-ex-date="${item.exDate}" data-stock-ratio="${item.stockRatio}"
+      title="依除權基準日當下持股計算；無償配股不增加成本，均價會自動稀釋"
+      ${tradesState.mutating ? "disabled aria-busy=\"true\"" : ""}>記除權配股 · +${item.bonusShares.toLocaleString("zh-TW")} 股</button>`;
+
   const quickDividendButton = (item) => `
     <button class="hold-div-quick" type="button" data-dividend-quick
       data-code="${item.stock.code}" data-cash="${item.div.cash}"
@@ -3023,17 +3151,20 @@ function renderHoldingsPanel() {
 
   let totalValue = 0;
   let totalUnrealized = 0;
+  let pricedCost = 0; // 報酬率的分母只能算「有報價、已計入市值與未實現」的那部分成本
   let unpriced = 0;
   const holdRows = holdings
     .map((h) => {
       const stock = byCode.get(h.code);
-      const price = Number(stock?.price);
-      const hasPrice = Number.isFinite(price);
+      // 同上：Number(null)===0 會讓未報價的持股算出市值 0、未實現＝全額虧損，還會混進總計。
+      const price = positivePriceOrNull(stock?.price);
+      const hasPrice = price !== null;
       const value = hasPrice ? price * h.shares : null;
       const unrealized = hasPrice ? value - h.cost : null;
       if (hasPrice) {
         totalValue += value;
         totalUnrealized += unrealized;
+        pricedCost += h.cost;
       } else {
         unpriced += 1;
       }
@@ -3045,6 +3176,9 @@ function renderHoldingsPanel() {
         ? `<span class="hold-exdiv ${div.isToday ? "is-today" : ""}">${div.isToday ? "今日" : `${div.exDate.slice(5).replace("-", "/")} `}${escapeHtml(div.kind || "除息")}${Number.isFinite(div.cash) && div.cash > 0 ? ` 每股 ${formatNumber(div.cash, 6)} 元` : ""}${hasDividendEventRecord(tradesState.records, stock) ? " · 已記" : ""}</span>`
         : "";
       const divQuick = quickDividendByCode.has(h.code) ? quickDividendButton(quickDividendByCode.get(h.code)) : "";
+      const caQuick = quickCorporateActionByCode.has(h.code)
+        ? quickCorporateActionButton(quickCorporateActionByCode.get(h.code))
+        : "";
       return `
         <div class="hold-row">
           <span class="hold-name"><strong>${escapeHtml(stock?.name || h.code)}</strong><span>${h.code}</span>${divChip}</span>
@@ -3056,12 +3190,15 @@ function renderHoldingsPanel() {
           ${h.dividends > 0 ? `<span class="hold-cell"><em>已入帳股利</em><b>${formatMoney(h.dividends)}</b></span>` : ""}
           <span class="hold-cell hold-pnl ${tone}"><em>未實現</em><b>${unrealized != null ? `${formatMoney(unrealized, { signed: true })}${pct != null ? `（${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%）` : ""}` : "--"}</b></span>
           ${divQuick}
+          ${caQuick}
         </div>`;
     })
     .join("");
 
   const totalCost = pf?.totals?.cost || 0;
-  const totalPct = totalCost > 0 ? (totalUnrealized / totalCost) * 100 : null;
+  // 分母必須與分子同口徑：totalUnrealized 只累加有報價的持股，若拿含未報價部位的 totalCost 當分母，
+  // 報酬率會被灌水稀釋（例：+10,000 / 有報價成本 100,000 = +10%，用全部成本 200,000 算變 +5%）。
+  const totalPct = pricedCost > 0 ? (totalUnrealized / pricedCost) * 100 : null;
   const upTone = totalUnrealized >= 0 ? "is-up" : "is-down";
   const realizedPnl = pf?.totals?.realizedPnl || 0;
   const dividendRecognizedGross = Number(pf?.totals?.dividendRecognizedGross ?? pf?.totals?.dividendIncome) || 0;
@@ -3096,6 +3233,29 @@ function renderHoldingsPanel() {
     .reverse()
     .slice(0, tradesHistoryLimit)
     .map((t) => {
+      // 公司行動（除權／現增）是「事件」不是「成交」：沒有價金、股數與費稅，
+      // 底下整套買賣／股利的欄位讀取全都不適用（實測會在 shares.toLocaleString 直接丟例外）。
+      // 用獨立的精簡列呈現，說明它對持股做了什麼，讓帳本的變化可稽核。
+      if (t.side === "corporateAction") {
+        const caDate = tradeDateOf(t) || "";
+        const stockRatio = finiteNumberOrNull(t.stockRatio) || 0;
+        const subscriptionRatio = finiteNumberOrNull(t.subscriptionRatio) || 0;
+        const subscriptionPrice = finiteNumberOrNull(t.subscriptionPrice) || 0;
+        const parts = [];
+        if (stockRatio > 0) parts.push(`無償配股 ${(stockRatio * 100).toFixed(2).replace(/\.?0+$/, "")}%`);
+        if (subscriptionRatio > 0) {
+          parts.push(`現增 ${(subscriptionRatio * 100).toFixed(2).replace(/\.?0+$/, "")}%＠${formatNumber(subscriptionPrice)} 元`);
+        }
+        return `
+          <div class="trade-row is-corporate-action">
+            <span class="trade-side is-corporate">權</span>
+            <span class="trade-main">
+              <strong>${escapeHtml(t.code)}</strong>
+              <small>${escapeHtml(`${caDate.slice(4, 6)}/${caDate.slice(6, 8)}`)} · ${escapeHtml(parts.join("、") || "公司行動")}</small>
+            </span>
+            <span class="trade-note">依基準日持股調整股數；無償配股不增加成本</span>
+          </div>`;
+      }
       const r = realizedById.get(t.id);
       const isDiv = t.side === "dividend";
       const dividendStatus = isDiv && (t.status === "receivable" || t.status === "received")
@@ -3176,7 +3336,8 @@ function renderHoldingsPanel() {
         <div data-dividend-summary="receivable"><span>待入帳</span><strong>${formatMoney(dividendReceivableGross)}</strong></div>
         <div data-dividend-summary="received"><span>已入帳淨額</span><strong>${formatMoney(dividendReceivedNet)}</strong></div>
       </div>` : ""}
-    ${unpriced ? `<p class="hold-hint">${unpriced} 檔暫無報價，未計入市值與未實現損益（開盤後會自動補上）。</p>` : ""}
+    ${renderMissingCorporateActions()}
+    ${unpriced ? `<p class="hold-hint">${unpriced} 檔暫無報價，未計入市值與未實現損益，報酬率分母也只算已報價部位（開盤後會自動補上）；「總成本」仍為全部持股。</p>` : ""}
     ${closedPositionDividendHtml}
     ${tradesState.quarantinedRecords.length ? `<div class="trade-review-banner" role="status"><strong>${tradesState.quarantinedRecords.length} 筆舊資料待整理</strong><span>原始內容已安全保留，未納入持股與損益；不會在升級時被靜默刪除。</span></div>` : ""}
     <div class="hold-list">
@@ -3613,12 +3774,6 @@ function removeSelectedWatchStocks() {
   return selectedCodes.length;
 }
 
-function syncStockWatchFlags() {
-  stocks.forEach((stock) => {
-    stock.watch = watchLists[1].has(stock.code);
-  });
-}
-
 function mergeOfficialQuote(stock, quote) {
   if (!stock || !quote) return;
   const latestPrice = positivePriceOrNull(quote.price);
@@ -3743,7 +3898,6 @@ function upsertStockFromQuote(quote) {
       avgVol: 0,
       groups: ["watch"],
       strategies: ["官方查詢"],
-      watch: false,
       spark: seedSpark.length >= 2 ? seedSpark : price !== null ? [price, price] : [],
     };
     stocks.push(stock);
@@ -4671,7 +4825,7 @@ function eligibleAlertQuoteCodes(quotes) {
       const asOfDate = String(quote?.asOf || quote?.rawDate || "").slice(0, 10).replaceAll("/", "-");
       return ["realtime", "broker-realtime"].includes(quote?.sourceKind)
         && quote?.priceStale !== true
-        && Number.isFinite(Number(quote?.price))
+        && positivePriceOrNull(quote?.price) !== null
         && asOfDate === today;
     })
     .map((quote) => normalizeStockCodeInput(quote.code))
@@ -4714,6 +4868,8 @@ async function loadMarketData({ notify = false, renderNow = true } = {}) {
     dataState.quoteCount = quotes.length;
     dataState.realtimeCount = payloads.reduce((sum, payload) => sum + (Number(payload.realtimeCount) || 0), 0);
     dataState.fallbackCount = payloads.reduce((sum, payload) => sum + (Number(payload.fallbackCount) || 0), 0);
+    dataState.warnings = [...new Set(payloads.flatMap((payload) => payload.warnings || []).filter(Boolean))];
+    dataState.degraded = payloads.some((payload) => payload.dataQuality?.degraded === true);
     const realtimeErrors = [...new Set(payloads.map((payload) => payload.realtimeError).filter(Boolean))];
     dataState.error = realtimeErrors.length ? `即時源部分失敗：${realtimeErrors.join("；")}` : "";
     // 到價狀態和本輪行情一起提交，避免同一批資料先畫一次、觸價後又立刻畫第二次。
@@ -4737,6 +4893,8 @@ async function loadMarketData({ notify = false, renderNow = true } = {}) {
     dataState.quoteCount = 0;
     dataState.realtimeCount = 0;
     dataState.fallbackCount = 0;
+    dataState.warnings = [];
+    dataState.degraded = false;
     dataState.error = error.message;
     if (renderNow) render();
     if (notify) showToast(`${getSelectedSourceLabel()}更新失敗`);
@@ -4847,7 +5005,6 @@ function upsertStockFromPick(pick) {
       avgVol: pick.metrics?.volumeRatio5 || 0,
       groups: ["overnight"],
       strategies: [pick.groupName],
-      watch: false,
       // 用「隱含昨收→訊號日收盤」兩點起步，之後官方報價會把真實價格接上去；
       // 不再用均線值假造價格路徑。
       spark: [
@@ -4892,7 +5049,7 @@ function renderOvernightGroups() {
     el.overnightGroups.innerHTML = `
       <div class="overnight-error">
         <strong>官方隔日沖清單產生失敗</strong>
-        <span>${overnightState.error}</span>
+        <span>${escapeHtml(overnightState.error)}</span>
         <small>請確認已用 npm start 啟動，並使用 http://127.0.0.1:5174/ 開啟。</small>
       </div>
     `;
@@ -5021,7 +5178,10 @@ function renderOvernightGroups() {
   el.overnightGroups.innerHTML = `
     <div class="overnight-summary">
       <div class="overnight-summary-primary">
-        <strong>${state.overnightView === "overview" ? "隔日沖總覽 v1" : `只看：${activeGroup?.[1] || "隔日沖分群"}`}</strong>
+        <!-- 這裡原本寫死「隔日沖總覽 v1」。它指的是面板版面版本，但畫面上從不顯示真正的
+             公式版本（OVERNIGHT_FORMULA_VERSION 目前已是 v3），使用者看到的唯一一個「v」
+             會被讀成引擎版本。標籤本身對使用者沒有資訊量，直接拿掉。 -->
+        <strong>${state.overnightView === "overview" ? "隔日沖總覽" : `只看：${activeGroup?.[1] || "隔日沖分群"}`}</strong>
         <span><b>訊號日</b>${dateLabels.signalLabel}</span>
         <span><b>觀察日</b>${dateLabels.observationLabel}</span>
       </div>
@@ -5114,7 +5274,7 @@ function renderSignalVerification() {
           ${coverageLabel ? `<span>${escapeHtml(coverageLabel)}</span>` : ""}
           <span class="${hitTone}">達+2%：${summary.hitPlus2 ?? 0}/${summary.total ?? 0}</span>
           <span class="negative">破-2%：${summary.brokeMinus2 ?? 0}/${summary.total ?? 0}</span>
-          <span>${isIntraday ? "平均現價" : "平均收盤"} ${formatSignedPercent(summary.avgCurrentReturn)}</span>
+          <span>${isIntraday ? "平均現價" : "平均收盤"} ${formatGrossWithNet(summary.avgCurrentReturn, summary.avgCurrentReturnNet)}</span>
         </div>
       </header>
       <div class="verify-rows">
@@ -5195,7 +5355,7 @@ function renderVerifyHistory() {
             <span>累計 ${totals.days} 天 / ${totals.signals} 檔</span>
             <span class="${totals.signals && totals.hitPlus2 / totals.signals >= 0.5 ? "positive" : ""}">達+2% ${rate(totals.hitPlus2, totals.signals)}</span>
             <span class="negative">破-2% ${rate(totals.brokeMinus2, totals.signals)}</span>
-            <span>平均隔日收 ${formatSignedPercent(totals.avgCloseReturn)}</span>
+            <span>平均隔日收 ${formatGrossWithNet(totals.avgCloseReturn, totals.avgCloseReturnNet)}</span>
           </div>
         ` : ""}
       </header>
@@ -5237,7 +5397,7 @@ function renderBacktestPerformance() {
           <div><dt>隔日破 -2%</dt><dd>${rate(item.brokeMinus2Rate)}</dd></div>
           <div><dt>平均開盤</dt><dd>${ret(item.avgOpenReturn)}</dd></div>
           <div><dt>平均最高</dt><dd>${ret(item.avgHighReturn)}</dd></div>
-          <div><dt>平均收盤</dt><dd>${ret(item.avgCloseReturn)}</dd></div>
+          <div><dt>平均收盤</dt><dd>${formatGrossWithNet(item.avgCloseReturn, item.avgCloseReturnNet)}</dd></div>
         </dl>
       </article>
     `)
@@ -5403,9 +5563,14 @@ function renderSwingCard(pick) {
     if (volRatio >= 1.2) reasons.push(`量能放大（量比 ${volRatio.toFixed(1)}）`);
     else if (volRatio >= 0.9) reasons.push("量能持穩");
   }
+  // 「划不划算」要用**淨**盈虧比判斷（門檻也是套在淨值上）。用毛值講「相當划算」會在
+  // 高風險設定上失準：毛 2.0 但停損很近時，扣掉來回成本後可能只剩 1.3。
+  // 兩個數字都顯示，讓使用者看得出成本吃掉多少。
+  const rrNet = Number(pick.plan?.rrNet);
   if (Number.isFinite(rr)) {
-    if (rr >= 2) reasons.push(`盈虧比 ${rr.toFixed(1)}、相當划算`);
-    else if (rr >= 1) reasons.push(`盈虧比 ${rr.toFixed(1)}`);
+    const shown = Number.isFinite(rrNet) ? `盈虧比 ${rr.toFixed(1)}（淨 ${rrNet.toFixed(1)}）` : `盈虧比 ${rr.toFixed(1)}`;
+    const judged = Number.isFinite(rrNet) ? rrNet : rr;
+    reasons.push(judged >= 2 ? `${shown}、相當划算` : shown);
   }
   if (score >= 80) reasons.push(`型態分 ${score} 偏高`);
   const reasonHtml = reasons.length
@@ -5431,8 +5596,8 @@ function renderSwingCard(pick) {
     ? ' title="股名後的 * 是官方標記的「彈性面額股」：每股面額不是新台幣 10 元（可能 0.25／1／5 元…）。因此它的股價高低不能直接跟一般股票（面額 10 元）相比，看市值才準。這不是風險警示。"'
     : "";
   return `
-    <article class="swing-card" data-swing-code="${pick.code}" role="button" tabindex="0" aria-label="${pick.name} ${pick.code} 策略明細">
-      <div class="swing-rank-badge ${scoreTier}" style="--score:${Math.max(6, Math.min(100, score))}%" title="策略評分 0–100：趨勢＋MACD動能＋貼近中軌＋量能＋流動性＋盈虧比綜合計算，越高代表型態越好且越划算；盈虧比<1 的設定不列入。RANK 依評分由高到低排名。">
+    <article class="swing-card" data-swing-code="${pick.code}" role="button" tabindex="0" aria-label="${escapeHtml(pick.name)} ${pick.code} 策略明細">
+      <div class="swing-rank-badge ${scoreTier}" style="--score:${Math.max(6, Math.min(100, score))}%" title="策略評分 0–100：趨勢＋MACD動能＋貼近中軌＋量能＋流動性＋盈虧比綜合計算，越高代表型態越好且越划算；扣掉一買一賣手續費與證交稅之後的淨盈虧比小於 1 的設定不列入。RANK 依評分由高到低排名。">
         <small>RANK</small>
         <strong>${pick.rank}</strong>
         <em>${score}<i>分</i></em>
@@ -5441,9 +5606,9 @@ function renderSwingCard(pick) {
       <div class="swing-head">
         <div class="swing-headline">
           <div class="swing-identity">
-            <strong class="swing-nm"${nameTitle}>${pick.name}</strong>
+            <strong class="swing-nm"${nameTitle}>${escapeHtml(pick.name)}</strong>
             <span class="swing-code">${pick.code}</span>
-            <span class="swing-market">${pick.market || formatExchangeLabel(pick.exchange)}</span>
+            <span class="swing-market">${escapeHtml(pick.market || formatExchangeLabel(pick.exchange))}</span>
           </div>
           <span class="swing-quote-inline">
             <span class="${closeLabelClass}" title="${closeLabelTitle}">${closeLabel}</span>
@@ -5455,9 +5620,12 @@ function renderSwingCard(pick) {
           <div class="swing-tags">
           <span class="swing-scenario-badge">${pick.scenario?.name ? glossLink(pick.scenario.name) : "—"}</span>
           ${pick.surveillance ? `<span class="surv-line swing-surv">${renderSurveillanceBadge(pick.surveillance)}</span>` : ""}
+          ${pick.fillRisk === "limit-up-locked"
+            ? `<span class="swing-warn is-alert" title="今天整天只有漲停這一個成交價，掛買單排不到，下方的「進場」價位今天買不到。訊號本身仍然成立，但這檔不會列入波段驗證統計。">漲停鎖死・今天買不到</span>`
+            : ""}
           ${warns}
           </div>
-          <p class="swing-desc">${pick.scenario?.desc || ""}</p>
+          <p class="swing-desc">${escapeHtml(pick.scenario?.desc || "")}</p>
         </div>
         ${reasonHtml}
         <div class="swing-facts">${factsHtml}</div>
@@ -5468,8 +5636,14 @@ function renderSwingCard(pick) {
         <div class="swing-stat" title="初始停損：進場後先設在收盤 −5%"><span>${glossLink("建議停損")} <i class="swing-stat-hint">−5%</i></span><strong>${formatNumber(pick.plan?.initialStop)}</strong></div>
         <div class="swing-stat" title="依支撐（擺動低點／布林下軌／月線）設的較大停損；盈虧比就是用它算的"><span>${glossLink("結構停損")}</span><strong>${formatNumber(pick.plan?.structuralStop)}</strong></div>
         <div class="swing-stat swing-stat-sub" title="進階：股價漲到此價（收盤 +5%）後，改用移動停利往上跟、鎖住獲利"><span>${glossLink("啟動移停")} <i class="swing-stat-hint">+5%</i></span><strong>${formatNumber(pick.plan?.trailingTrigger)}</strong></div>
-        <div class="swing-stat" title="上方壓力或波段量測幅度推估的目標價"><span>${glossLink("目標")}</span><strong>${formatNumber(pick.plan?.target)}</strong></div>
-        <div class="swing-stat swing-rr ${rrTone}" title="盈虧比＝(目標−進場)÷(進場−結構停損)，越大越划算"><span>${glossLink("盈虧比")}</span><strong>${Number.isFinite(rr) ? rr.toFixed(1) : "—"}</strong></div>
+        <div class="swing-stat" title="上方壓力或波段量測幅度推估的目標價${Number.isFinite(pick.plan?.nearestResistance)
+          ? `。⚠ 上方 ${formatNumber(pick.plan.nearestResistance)} 還有一個更近的擺動高點，它太貼近收盤價（2% 內）所以不當目標用，但路上會先遇到它。`
+          : ""}"><span>${glossLink("目標")}</span><strong>${formatNumber(pick.plan?.target)}</strong>${
+          Number.isFinite(pick.plan?.nearestResistance) ? '<i class="swing-stat-hint is-warn">前有壓力</i>' : ""
+        }</div>
+        <div class="swing-stat swing-rr ${rrTone}" title="盈虧比＝(目標−進場)÷(進場−結構停損)。括號內是扣掉一買一賣手續費與證交稅之後的淨值，選股門檻用的是淨值（毛值會讓「剛好過關」的設定其實賠錢）"><span>${glossLink("盈虧比")}</span><strong>${Number.isFinite(rr) ? rr.toFixed(1) : "—"}${
+          Number.isFinite(pick.plan?.rrNet) ? `<i class="swing-stat-hint">淨 ${pick.plan.rrNet.toFixed(1)}</i>` : ""
+        }</strong></div>
       </div>
       ${riskRewardBar}
     </article>
@@ -5583,7 +5757,11 @@ function renderSwingVerifyPanel() {
   const chips = scenarios
     .map((s) => {
       const resolved = s.wins + s.losses + s.expired;
-      const rate = s.winRate != null ? `${s.winRate}%` : "--";
+      // 樣本不足時不顯示百分比、也不染色——1 筆結案的「100%」在視覺上會跟累積數十筆的
+      // 綠字長得一樣，那是誤導。改成把累積進度講出來，讓使用者知道還要等多久。
+      const minSamples = Number(s.winRateMinSamples) || 20;
+      const belowMinSamples = s.winRate == null && resolved > 0;
+      const rate = s.winRate != null ? `${s.winRate}%` : belowMinSamples ? `累積中 ${resolved}/${minSamples}` : "--";
       const tone = s.winRate == null ? "" : s.winRate >= 50 ? "is-up" : "is-down";
       return `
         <div class="sv-chip">
@@ -5591,7 +5769,7 @@ function renderSwingVerifyPanel() {
             <strong>${escapeHtml(swingScenarioName(s.scenario))}</strong>
             <span class="sv-rate ${tone}"><small>勝率</small> ${rate}</span>
           </div>
-          <small>結案 ${resolved}（達標 ${s.wins}・停損 ${s.losses}・超時 ${s.expired}）・追蹤中 ${s.pending}${s.avgResultPct != null ? `・平均 ${s.avgResultPct >= 0 ? "+" : ""}${s.avgResultPct}%` : ""}${s.avgDaysHeld != null ? `・平均持有 ${s.avgDaysHeld} 天` : ""}</small>
+          <small>結案 ${resolved}（達標 ${s.wins}・停損 ${s.losses}・超時 ${s.expired}）・追蹤中 ${s.pending}${s.stalled ? `<span class="sv-stalled" title="這些單因官方日 K 長期缺漏而停在缺口前，不會自行結案，也永遠不會進入上面的勝率分母。">（含卡住 ${s.stalled}）</span>` : ""}${s.avgResultPct != null ? `・平均 ${s.avgResultPct >= 0 ? "+" : ""}${s.avgResultPct}%${s.avgResultPctNet != null ? `（淨 ${s.avgResultPctNet >= 0 ? "+" : ""}${s.avgResultPctNet}%）` : ""}` : ""}${s.avgDaysHeld != null ? `・平均持有 ${s.avgDaysHeld} 天` : ""}</small>
         </div>`;
     })
     .join("");
@@ -5614,7 +5792,7 @@ function renderSwingVerifyPanel() {
   panel.innerHTML = `
     <div class="sv-head">
       <strong>場景勝率（前向驗證）</strong>
-      <small title="每天的選股依官方日 K 逐日對答案：先碰目標＝達標、先碰結構停損＝停損；同一天兩邊都碰到，保守記停損。漏開 App 會按日期補判，中間缺 K 則停住、不跳日。">官方日 K 逐日補驗・雙觸保守記停損${data.dataGapCount ? `・${data.dataGapCount} 筆待補缺口` : ""}${legacySamples ? `・舊版 ${legacySamples} 筆另存` : ""}</small>
+      <small title="每天的選股依官方日 K 逐日對答案：先碰目標＝達標、先碰結構停損＝停損；同一天兩邊都碰到，保守記停損。漏開 App 會按日期補判，中間缺 K 則停住、不跳日。&#10;處置期間的標的是分盤集合競價（每 5 或 20 分鐘撮合一次），日 K 的最高／最低價只是幾十次撮合的極值，掛在停損／目標的單未必真的撮得到；這些樣本仍計入勝率，但會單獨標出筆數。&#10;除權息當天若官方比率還沒發布（計算結果表約次一營業日才有），該單會暫停推進而不是拿事件前的停損價去比事件後的價格；等比率到齊會自動接著判，觀察天數不會被吃掉。">官方日 K 逐日補驗・雙觸保守記停損${data.dataGapCount ? `・${data.dataGapCount} 筆待補缺口` : ""}${data.corporateActionPendingCount ? `・${data.corporateActionPendingCount} 筆等官方除權息比率` : ""}${data.periodicCallCount ? `・${data.periodicCallCount} 筆分盤撮合` : ""}${legacySamples ? `・舊版 ${legacySamples} 筆另存` : ""}</small>
     </div>
     <div class="sv-chips">${chips}</div>
     ${recentRows ? `
@@ -5686,7 +5864,7 @@ function renderStrategyBoard() {
     return;
   }
   if (strategyState.error) {
-    el.strategyBoard.innerHTML = `<div class="strategy-empty is-error">策略雷達計算失敗<small>${strategyState.error}</small></div>`;
+    el.strategyBoard.innerHTML = `<div class="strategy-empty is-error">策略雷達計算失敗<small>${escapeHtml(strategyState.error)}</small></div>`;
     return;
   }
   if (strategyState.loaded && !strategyState.picks.length) {
@@ -5698,9 +5876,24 @@ function renderStrategyBoard() {
     return;
   }
   const visiblePicks = strategyState.picks.filter((pick) => state.showSurveillance || !pick.surveillance);
-  el.strategyBoard.innerHTML = visiblePicks.length
+  // 後端一直有回 warnings（掃描覆蓋率、公司行動未定案、單一市場、last-good…），
+  // 前端也一直存進 strategyState.warnings——但**全檔沒有任何讀取點**，等於沒做。
+  // server.mjs 組裝這批 warnings 的地方自己寫著：「這個失敗模式在開發期間三天內出現三次
+  // （證交所限流），而且畫面上完全沒有跡象」。
+  //
+  // 沒有它的後果不是少一行字：證交所限流那天，看板照樣列出十幾檔、每張卡片照樣寫
+  // 「進場 X／停損 Y／目標 Z／盈虧比 2.0」，而那些均線、布林、MACD 是跑在**沒還原權息**的
+  // 價格上——與正常日完全無法分辨。
+  const boardWarnings = (strategyState.warnings || []).filter(Boolean);
+  const warningHtml = boardWarnings.length
+    ? `<div class="strategy-empty is-error" role="status">
+        <strong>這次掃描有 ${boardWarnings.length} 項資料品質問題，下面的名單可能不完整或不準確</strong>
+        <small>${escapeHtml(boardWarnings.slice(0, 3).join("；"))}${boardWarnings.length > 3 ? `（另有 ${boardWarnings.length - 3} 則）` : ""}</small>
+      </div>`
+    : "";
+  el.strategyBoard.innerHTML = warningHtml + (visiblePicks.length
     ? visiblePicks.map(renderSwingCard).join("")
-    : `<div class="strategy-empty">這個場景今天的標的都是注意/處置股，已被你隱藏。<small>到「更多 → 風險規則」可重新顯示。</small></div>`;
+    : `<div class="strategy-empty">這個場景今天的標的都是注意/處置股，已被你隱藏。<small>到「更多 → 風險規則」可重新顯示。</small></div>`);
 }
 
 // === 策略雷達：個股波段型態健檢（搜尋任意股票 → 逐條檢核 + 交易計畫）===
@@ -5747,11 +5940,11 @@ function renderStrategyInspect() {
   }
   host.hidden = false;
   if (st.loading) {
-    host.innerHTML = `<div class="strategy-empty is-loading"><span class="mini-spinner" aria-hidden="true"></span><strong>健檢「${st.query}」的波段型態…</strong></div>`;
+    host.innerHTML = `<div class="strategy-empty is-loading"><span class="mini-spinner" aria-hidden="true"></span><strong>健檢「${escapeHtml(st.query)}」的波段型態…</strong></div>`;
     return;
   }
   if (st.error) {
-    host.innerHTML = `<div class="inspect-card inspect-error"><button class="inspect-close" type="button" data-inspect-close aria-label="關閉">✕</button><strong>查不到「${st.query}」</strong><small>${st.error}</small></div>`;
+    host.innerHTML = `<div class="inspect-card inspect-error"><button class="inspect-close" type="button" data-inspect-close aria-label="關閉">✕</button><strong>查不到「${escapeHtml(st.query)}」</strong><small>${escapeHtml(st.error)}</small></div>`;
     return;
   }
   host.innerHTML = renderInspectCard(st.data);
@@ -5777,7 +5970,7 @@ function renderInspectCard(d) {
     const sIcon = s.passed ? "✅" : s.failCount <= 2 ? "⚠️" : "❌";
     const sStat = s.passed ? "符合" : `差 ${s.failCount} 項`;
     const items = (s.checks || []).map((c) =>
-      `<li class="${c.pass ? "ok" : "no"}"><span class="ic" aria-hidden="true">${c.pass ? "✓" : "✗"}</span><span class="lb">${c.label}</span><span class="dt">${c.detail || ""}</span></li>`
+      `<li class="${c.pass ? "ok" : "no"}"><span class="ic" aria-hidden="true">${c.pass ? "✓" : "✗"}</span><span class="lb">${escapeHtml(c.label)}</span><span class="dt">${escapeHtml(c.detail || "")}</span></li>`
     ).join("");
     return `<div class="inspect-scenario ${s.passed ? "is-pass" : ""}">
         <div class="inspect-scenario-head"><strong>${glossLink(s.name)}</strong><span class="inspect-scenario-stat ${s.passed ? "ok" : "no"}">${sIcon} ${sStat}</span></div>
@@ -5810,9 +6003,9 @@ function renderInspectCard(d) {
       </div>
       <div class="swing-head">
         <div class="swing-headline">
-          <strong class="swing-nm">${d.name}</strong>
+          <strong class="swing-nm">${escapeHtml(d.name)}</strong>
           <span class="swing-code">${d.code}</span>
-          <span class="swing-market">${d.market || ""}</span>
+          <span class="swing-market">${escapeHtml(d.market || "")}</span>
           <span class="swing-quote-inline">
             <span class="${labelClass}" title="${labelTitle}">${md} 收盤</span>
             <span class="swing-price">${formatNumber(d.price)}</span>
@@ -7045,12 +7238,34 @@ function renderTechnicalAnalysis() {
   const macd = last?.macd || {};
   const signals = data.signals || {};
   const priceContext = getTechnicalPriceContext(data, last);
-  const trendState = signals.breakout ? "突破壓力線" : signals.breakdown ? "跌破支撐線" : "區間觀察";
-  const badge = signals.longWatch ? "做多觀察" : signals.risks?.length ? "風險提醒" : "技術觀察";
-  const badgeClass = signals.longWatch ? "is-positive" : signals.risks?.length ? "is-risk" : "is-neutral";
-  el.technicalStatus.hidden = true;
-  el.technicalStatus.className = "technical-status";
-  el.technicalStatus.textContent = "";
+  // 官方公司行動欄位不齊時後端會把型態結論整組停掉。這裡必須跟著改寫文案——
+  // 沿用「尚未同時滿足突破、量能、MACD 與均線條件」會把「沒評估」講成「評估過但沒過」。
+  const suppressed = Boolean(signals.suppressed);
+  // 「今天剛穿過」（breakout/breakdown）與「已經站在線的哪一側」（aboveResistance/belowSupport）
+  // 是兩件事。只講事件的話，價格早就站上壓力線之後，畫面會同時顯示「壓力 3669.71」與
+  // 「沒有明確突破」——使用者看到收盤 3750 高於壓力 3670，那句話等於在騙他。
+  // 實例：2454 聯發科 2026-07-24。
+  const trendState = suppressed
+    ? "暫不判讀"
+    : signals.breakout ? "突破壓力線"
+      : signals.breakdown ? "跌破支撐線"
+        : signals.aboveResistance ? "壓力線上方"
+          : signals.belowSupport ? "支撐線下方"
+            : "區間觀察";
+  const badge = suppressed ? "暫不判讀" : signals.longWatch ? "做多觀察" : signals.risks?.length ? "風險提醒" : "技術觀察";
+  const badgeClass = suppressed ? "is-neutral" : signals.longWatch ? "is-positive" : signals.risks?.length ? "is-risk" : "is-neutral";
+  // 還原權息提示：純官方還原只放進下方明細（台股年年配息，天天掛警示等於沒警示）；
+  // 只有估算還原或官方欄位不齊才升級成上方的醒目提示。
+  const caNotes = data.corporateActions?.notes || [];
+  if (data.corporateActions?.alert && caNotes.length) {
+    el.technicalStatus.hidden = false;
+    el.technicalStatus.className = "technical-status";
+    el.technicalStatus.textContent = caNotes.join(" ");
+  } else {
+    el.technicalStatus.hidden = true;
+    el.technicalStatus.className = "technical-status";
+    el.technicalStatus.textContent = "";
+  }
   el.technicalTitle.textContent = `${data.code} ${data.name} ${periodLabel}`;
   el.technicalSubtitle.textContent = `${priceContext.summaryLabel} ${formatTechnicalValue(last.close)} / MACD OSC ${formatTechnicalValue(macd.histogram, 4)} / ${trendState}`;
   el.technicalBadge.textContent = badge;
@@ -7059,12 +7274,17 @@ function renderTechnicalAnalysis() {
     <article class="technical-score-card ${badgeClass}">
       <span>目前狀態</span>
       <strong>${badge}</strong>
-      <p>${signals.longWatch ? "符合做多觀察條件，但不是買賣建議。" : signals.risks?.length ? "出現風險條件，先降低解讀強度。" : "尚未同時滿足突破、量能、MACD 與均線條件。"}</p>
+      <p>${suppressed ? "官方公司行動的公式欄位未齊備，這段歷史價格沒有正確還原，暫不提供型態結論。" : signals.longWatch ? "符合做多觀察條件，但不是買賣建議。" : signals.risks?.length ? "出現風險條件，先降低解讀強度。" : "尚未同時滿足突破、量能、MACD 與均線條件。"}</p>
     </article>
     <article>
       <span>趨勢線</span>
       <strong>${trendState}</strong>
-      <p>${signals.breakout ? "收盤價突破近期壓力線。" : signals.breakdown ? "收盤價跌破上升支撐線。" : "目前沒有明確突破或跌破。"}</p>
+      <p>${suppressed ? "還原基礎不完整，不判斷突破或跌破。"
+        : signals.breakout ? "收盤價突破近期壓力線。"
+          : signals.breakdown ? "收盤價跌破上升支撐線。"
+            : signals.aboveResistance ? "收盤價已在壓力線上方，但不是今天才突破的。"
+              : signals.belowSupport ? "收盤價已在支撐線下方，但不是今天才跌破的。"
+                : "目前沒有明確突破或跌破。"}</p>
     </article>
     <article>
       <span>MACD</span>
@@ -7074,7 +7294,7 @@ function renderTechnicalAnalysis() {
     <article>
       <span>量能</span>
       <strong>${formatTechnicalValue(last.volumeLots, 0)} 張</strong>
-      <p>${signals.checks?.volumeAbove20 ? "大於近 20 根平均量。" : "尚未高於近 20 根平均量。"}</p>
+      <p>${suppressed ? "還原基礎不完整，暫不做量能判定。" : signals.checks?.volumeAbove20 ? "大於近 20 根平均量。" : "尚未高於近 20 根平均量。"}</p>
     </article>
   `;
   el.technicalDetailGrid.innerHTML = renderTechnicalDetails(data);
@@ -7167,31 +7387,72 @@ function renderTechnicalEmpty(title, text) {
   `;
 }
 
+// 還原權息明細：圖上的歷史價格已經不是當時的實際成交價，這件事一定要講。
+// 用詞受規格約束——只有官方公告可以講「除權息」，跳空推測一律是「疑似／估算」。
+function renderTechnicalCorporateActions(data) {
+  const info = data.corporateActions;
+  if (!info) return "";
+  const monthDay = (compact) => `${String(compact).slice(4, 6)}/${String(compact).slice(6, 8)}`;
+  // exchange-* 是交易所自己算出來的參考價（比我們套公式更可信），official 是官方公告＋公式，
+  // 其餘都是跳空推測，一律講「估算」。
+  const sourceLabel = (source) => (source === "exchange-result" || source === "exchange-quote"
+    ? "交易所"
+    : source === "official" ? "官方公告" : "估算");
+  const eventList = info.events?.length
+    ? info.events.map((event) => `<span>${escapeHtml(monthDay(event.date))}：×${escapeHtml(String(event.ratio ?? "--"))}（${escapeHtml(sourceLabel(event.source))}）</span>`).join("")
+    // 「沒有偵測到」不等於「沒有發生」。偵測涵蓋除權息（官方參考價／公告公式）與 >10.5% 的
+    // 跳空推測；幅度小於這個門檻的減資不會被發現，圖上會維持原始跳空。這是資料源的限制
+    // （官方沒有機器可讀的減資／面額變更端點），寫成「沒有公司行動」會是過度宣稱。
+    : '<span title="偵測範圍：官方除權息參考價與公告公式，加上超過 10.5% 的跳空推估。幅度小於 10.5% 的減資沒有官方端點可查，不會被偵測到，圖上會保留原始跳空。">'
+      + "這段區間沒有偵測到公司行動，圖上就是原始成交價。</span>";
+  const notes = (info.notes || []).map((note) => `<p>${escapeHtml(note)}</p>`).join("");
+  return `
+    <article>
+      <h3>還原權息</h3>
+      <div class="technical-level-list">${eventList}</div>
+      ${notes}
+    </article>
+  `;
+}
+
 function renderTechnicalDetails(data) {
   const signals = data.signals || {};
   const fib = data.fibonacci || {};
+  const suppressed = Boolean(signals.suppressed);
   const signalTags = signals.signals?.length ? signals.signals : ["尚未出現明確突破訊號"];
   const riskTags = signals.risks?.length ? signals.risks : ["目前沒有觸發風險條件"];
   const fibLevels = fib.active
     ? fib.levels.map((level) => `<span>${level.ratio}：${formatTechnicalValue(level.price)}${level.near ? " / 回測觀察區" : ""}</span>`).join("")
-    : "<span>尚未偵測到突破，暫不繪製費波回撤。</span>";
+    : `<span>${suppressed ? "還原基礎不完整，暫不繪製費波回撤。" : "尚未偵測到突破，暫不繪製費波回撤。"}</span>`;
   const support = data.trendLines?.support;
   const resistance = data.trendLines?.resistance;
-  return `
-    <article>
-      <h3>做多觀察條件</h3>
+  // 停判期間四個條件全是未評估，不能畫成「評估過但沒過」的灰勾。
+  const checksBlock = suppressed
+    ? `<p>官方公司行動的公式欄位未齊備，四項條件都沒有評估。</p>`
+    : `
       <div class="technical-checks">
         <span class="${signals.checks?.closeAboveResistance ? "is-pass" : ""}">突破壓力線</span>
         <span class="${signals.checks?.macdOk ? "is-pass" : ""}">MACD 轉強</span>
         <span class="${signals.checks?.volumeAbove20 ? "is-pass" : ""}">量大於 20 均量</span>
         <span class="${signals.checks?.aboveMovingAverages ? "is-pass" : ""}">站上 MA5 / MA20</span>
       </div>
+    `;
+  const signalBlock = suppressed
+    ? `<div class="technical-chip-list"><span>暫不判讀突破與風險</span></div>`
+    : `
+      <div class="technical-chip-list">${signalTags.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+      <div class="technical-chip-list is-risk">${riskTags.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+    `;
+  return `
+    <article>
+      <h3>做多觀察條件</h3>
+      ${checksBlock}
     </article>
     <article>
       <h3>突破與風險</h3>
-      <div class="technical-chip-list">${signalTags.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
-      <div class="technical-chip-list is-risk">${riskTags.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+      ${signalBlock}
     </article>
+    ${renderTechnicalCorporateActions(data)}
     <article>
       <h3>費波回撤</h3>
       <div class="technical-level-list">${fibLevels}</div>
@@ -9106,13 +9367,13 @@ function renderDetail() {
       detailTags: "正在抓官方報價",
       detailPrice: "--",
       detailChange: "",
-      detailUnit: "--",
-      detailTotal: "--",
     };
     for (const [id, text] of Object.entries(placeholders)) {
       const node = document.getElementById(id);
       if (node) node.textContent = text;
     }
+    // 報價還沒進來，不該留著上一檔的漲跌底色與 stale 邊框。
+    document.getElementById("priceHero")?.classList.remove("is-up", "is-down", "is-flat", "is-stale");
     return;
   }
   const indicatorAliasMap = {
@@ -9136,15 +9397,27 @@ function renderDetail() {
   // 收盤價仍有相對昨收的有效漲跌；是否即時由上方「收盤」標記揭露。
   // 只有平盤才使用中性色，避免把實際收漲／收跌誤畫成灰色。
   const neutral = isFlat;
-  const movement = neutral ? "" : changeNum > 0 ? "positive" : "negative";
+  // 原本這裡還有一個 movement，只被下面「第 5 格」的渲染用掉，而那是死碼：
+  // .chart-metric.positive 從來沒有可見效果（em 與 strong 各有明確色，會蓋掉繼承來的顏色），
+  // 而且就算補上規則也是拿「股價方向」去染總量／週轉／法人合計／殖利率四個不同的東西。
   document.getElementById("detailName").textContent = `${stock.code} ${stock.name}`;
   const exchangeLabel = formatExchangeLabel(stock.exchange);
   const sourceKindLabel = quoteContext.label;
   const tagsEl = document.getElementById("detailTags");
+  // 「最後成交 07/24」已經是判讀過的結論，後面再接一次完整時戳「2026/07/24 13:30:00」
+  // 等於同一個日期講兩次，格式還不一致，而且在 430px 的欄寬剛好把副標擠成兩行。
+  // 結論已含那個日期時只補時間；沒含時保留原樣。完整時戳移到 title。
+  const asOfText = String(stock.asOf || "");
+  const asOfDateMatch = asOfText.match(/(\d{4})\/(\d{2})\/(\d{2})/);
+  const asOfMonthDay = asOfDateMatch ? `${asOfDateMatch[2]}/${asOfDateMatch[3]}` : "";
+  const asOfTime = (asOfText.match(/\d{2}:\d{2}/) || [""])[0];
+  const asOfLabel = asOfMonthDay && sourceKindLabel.includes(asOfMonthDay) ? asOfTime : asOfText;
   tagsEl.textContent = stock.official
-    ? [exchangeLabel, sourceKindLabel, stock.asOf || "", getDetailScreenContext(stock)].filter(Boolean).join(" ・ ")
+    ? [exchangeLabel, sourceKindLabel, asOfLabel, getDetailScreenContext(stock)].filter(Boolean).join(" ・ ")
     : `${formatStrategyLabel(stock.strategies[0])} ・ ${stock.groups.includes("overnight") ? "隔日沖訊號" : "盤中觀察"} ・ 本機推估`;
-  tagsEl.title = stock.official ? `資料來源：${stock.source || "官方"}` : "";
+  tagsEl.title = stock.official
+    ? `資料來源：${stock.source || "官方"}${asOfText ? ` / ${asOfText}` : ""}`
+    : "";
   document.getElementById("detailPrice").textContent = formatQuotePrice(stock.price);
   document.getElementById("detailChange").textContent = noLive
     ? `收盤 ${stock.priceChange !== undefined && stock.priceChange !== null ? `${formatSignedPrice(stock.priceChange)} ` : ""}(${formatSignedPercent(stock.change)})`
@@ -9153,9 +9426,16 @@ function renderDetail() {
       : stock.priceChange !== undefined && stock.priceChange !== null
         ? `${formatSignedPrice(stock.priceChange)} (${formatSignedPercent(stock.change)})`
         : `${stock.change >= 0 ? "▲" : "▼"}${Math.abs(stock.change).toFixed(2)}%`;
-  document.getElementById("detailUnit").textContent = formatOptionalNumber(stock.unit);
-  document.getElementById("detailTotal").textContent = formatOptionalNumber(stock.total);
-  document.querySelector(".price-hero > div:first-child").style.background = neutral ? "#434a56" : changeNum > 0 ? "var(--up-surface)" : "var(--down-surface)";
+  // 漲跌方向與新鮮度都用 class 交給 CSS（與 .market-pill / .chart-zoom-readout 同機制）。
+  // 舊寫法是 app.js 唯一一處 inline 顏色，而 #434a56 是全 repo 唯一出現的那個色碼；
+  // 更麻煩的是 inline style 會永久遮蔽 CSS 裡的背景規則，樣式沒有辦法覆寫。
+  const heroEl = document.getElementById("priceHero");
+  heroEl.classList.toggle("is-up", !neutral && changeNum > 0);
+  heroEl.classList.toggle("is-down", !neutral && changeNum < 0);
+  heroEl.classList.toggle("is-flat", neutral);
+  // 新鮮度第一次有視覺編碼：底色仍守台股紅漲綠跌（方向不可被新鮮度蓋掉），
+  // 「這不是即時成交」只用琥珀邊框揭露，配色沿用 .market-pill.is-stale。
+  heroEl.classList.toggle("is-stale", Boolean(noLive));
   // 策略基準收盤：若這檔同時在策略雷達榜單上（多半是從卡片點進來的），把卡片用的「官方收盤（當日凍結）」
   // 並排顯示在即時報價下方，讓使用者一眼看懂上方即時 vs 榜單基準的關係，不必回去卡片對照。
   const basisEl = document.getElementById("detailStrategyBasis");
@@ -9189,35 +9469,73 @@ function renderDetail() {
       : institutionalState.error
         ? "法人更新失敗"
         : "法人無資料";
+  // 價與均線的差才有方向（均價本身是水準值）。這與同一面板往下約 200px 的「技術均線」指標
+  // 用的是同一個判斷（buildIndicatorDetail 的 stock.price >= ma5），兩處顏色從此一致。
+  const priceNum = finiteNumberOrNull(stock.price);
+  const maDiffTone = (maValue) => (
+    priceNum === null || finiteNumberOrNull(maValue) === null ? "na" : metricToneFromNet(priceNum - maValue)
+  );
+  // 紅綠色盲下 MA 那兩格的顏色是**唯一**的編碼（法人有 +/-、營收 YoY 有 ▲▼，均線什麼都沒有），
+  // 所以再給一個文字編碼。用詞與同一面板往下 200px 的「技術均線」指標一致。
+  const maFlag = (tone) => (tone === "up" ? "價在上" : tone === "down" ? "價在下" : "");
+  // 收盤位置：收在當日最低＝最弱的形態，收在最高＝最強。三個數字本來都在畫面上，
+  // 只是被當成不相關的並列數字，從來沒有人把它們關聯起來。
+  // 這裡只比對已有的值、不新增任何計算或門檻，所以徽章永遠不會和畫面上的數字矛盾。
+  const dayHighNum = finiteNumberOrNull(stock.high ?? Math.max(...spark));
+  const dayLowNum = finiteNumberOrNull(stock.low ?? Math.min(...spark));
+  // 高＝低（一價到底／漲停鎖死／spark 只有一點）時收盤位置無定義；
+  // noLive 時 price 是退回的官方收盤價、不是這一天的成交，兩種情形都不標。
+  const canFlagPosition = dayHighNum !== null && dayLowNum !== null
+    && dayHighNum > dayLowNum && priceNum !== null && !noLive;
+  const atDayHigh = canFlagPosition && Math.abs(priceNum - dayHighNum) < 1e-9;
+  const atDayLow = canFlagPosition && Math.abs(priceNum - dayLowNum) < 1e-9;
+  // 「張」在五個格子裡各印一次，還把最長的字串塞進最窄的格子（實測 +1,200 張 溢出 3px）。
+  // 單位改由註腳講一次。formatShareLots 本身不動——formatters.test.mjs 直接驗它。
+  const netLots = (value) => String(formatShareLots(value)).replace(/\s*張$/, "");
   const detailMetrics = {
     即時: [
+      // 開高低都是「水準值」，沒有正負可言 → 不上色，語意由 label 承擔。
+      // 舊寫法把「高」寫死紅、「低」寫死綠，在下跌 3.23% 的日子裡紅色的最高價會被讀成利多。
       { label: "開", value: formatNumber(stock.open ?? spark[0]), tone: "neutral" },
-      { label: "高", value: formatNumber(stock.high ?? Math.max(...spark)), tone: "high" },
-      { label: "低", value: formatNumber(stock.low ?? Math.min(...spark)), tone: "low" },
-      { label: "單量", value: formatOptionalNumber(stock.unit), tone: "volume" },
-      { label: "總量", value: formatOptionalNumber(stock.total), tone: "total" },
+      { label: "高", value: formatNumber(stock.high ?? Math.max(...spark)), tone: "neutral", flag: atDayHigh ? "收最高" : "" },
+      { label: "低", value: formatNumber(stock.low ?? Math.min(...spark)), tone: "neutral", flag: atDayLow ? "收最低" : "" },
+      // 成交量是水準值；而且 --yellow 是注意股專用色、--violet 是處置股專用色，
+      // 明細面板不該佔用風險標示的色彩語彙。
+      { label: "單量", value: formatOptionalNumber(stock.unit), tone: "neutral" },
+      { label: "總量", value: formatOptionalNumber(stock.total), tone: "neutral" },
     ],
     均線: [
       { label: "昨收", value: formatNumber(stock.previousClose ?? spark[0]), tone: "neutral" },
-      { label: maTabIsDaily ? "MA5" : "盤中均", value: formatNumber(ma5), tone: "high" },
-      { label: maTabIsDaily && maLongLength >= 20 ? "MA20" : `${maLongLength}筆均`, value: formatNumber(maLong), tone: "low" },
-      { label: "量比5", value: stock.avgVol ? formatNumber(stock.avgVol) : "--", tone: "volume" },
-      { label: "週轉", value: stock.turnover ? `${formatNumber(stock.turnover)}%` : "--", tone: "total" },
+      { label: maTabIsDaily ? "MA5" : "盤中均", value: formatNumber(ma5), tone: maDiffTone(ma5), flag: maFlag(maDiffTone(ma5)) },
+      { label: maTabIsDaily && maLongLength >= 20 ? "MA20" : `${maLongLength}筆均`, value: formatNumber(maLong), tone: maDiffTone(maLong), flag: maFlag(maDiffTone(maLong)) },
+      // 量比與週轉率的「高低算好算壞」沒有既定門檻，強度判斷留在下方「量價摘要」（那裡已有門檻與說明）。
+      { label: "量比5", value: stock.avgVol ? formatNumber(stock.avgVol) : "--", tone: stock.avgVol ? "neutral" : "na" },
+      { label: "週轉", value: stock.turnover ? `${formatNumber(stock.turnover)}%` : "--", tone: stock.turnover ? "neutral" : "na" },
     ],
     法人: institutional
       ? [
-          { label: "外資", value: formatShareLots(institutional.foreignNet), tone: "neutral" },
-          { label: "投信", value: formatShareLots(institutional.trustNet), tone: "high" },
-          { label: "自營", value: formatShareLots(institutional.dealerNet), tone: "low" },
-          { label: "合計", value: formatShareLots(institutional.totalNet), tone: "volume" },
-          { label: "狀態", value: institutionalStatus, tone: "total" },
+          // 買賣超本身就有正負，紅綠必須跟著值走。舊寫法把投信寫死紅、自營寫死綠，
+          // 於是「紅色的 -800（賣超）」與「綠色的 +500（買超）」會直接讀成相反的意思。
+          { label: "外陸資", value: netLots(institutional.foreignNet), tone: metricToneFromNet(institutional.foreignNet) },
+          // 官方 T86 的「三大法人合計」含外資自營商，但它不在外陸資／投信／自營三欄裡。
+          // 少了這一格，畫面上四個數字永遠加不起來（實測差額正好等於外資自營商）。
+          { label: "外資自營", value: netLots(institutional.foreignDealerNet), tone: metricToneFromNet(institutional.foreignDealerNet) },
+          { label: "投信", value: netLots(institutional.trustNet), tone: metricToneFromNet(institutional.trustNet) },
+          { label: "自營", value: netLots(institutional.dealerNet), tone: metricToneFromNet(institutional.dealerNet) },
+          { label: "合計", value: netLots(institutional.totalNet), tone: metricToneFromNet(institutional.totalNet) },
+          // 「狀態」原本是第 6 格。6 欄格線是 span2×3 ＋ span3×2＝剛好 5 格，
+          // 第 6 格會長出只填 1/3 的孤行；而且「法人 2026-07-24」是句子，塞進 111px 必然截字。
+          // 已移到格線下方的註腳（detailNotes）。
         ]
       : [
-          { label: "狀態", value: institutionalStatus, tone: "neutral" },
-          { label: "外資", value: "N/A", tone: "high" },
-          { label: "投信", value: "N/A", tone: "low" },
-          { label: "自營", value: "N/A", tone: "volume" },
-          { label: "來源", value: institutionalState.source || "TWSE/TPEx", tone: "total" },
+          // 沒有資料時舊寫法的顏色最花（紅／綠／黃／紫），真正的錯誤反而最不顯眼。
+          // 而且 label 與有資料時對不起來（外資 vs 外陸資、少了外資自營與合計），
+          // 切分頁時格子會跳。改成與有資料分支一一對應的 5 格。
+          { label: "外陸資", value: "未揭露", tone: "na" },
+          { label: "外資自營", value: "未揭露", tone: "na" },
+          { label: "投信", value: "未揭露", tone: "na" },
+          { label: "自營", value: "未揭露", tone: "na" },
+          { label: "合計", value: "未揭露", tone: "na" },
         ],
     // 切到基本面籤才 lazy 抓（其餘時候只讀既有快取，不觸發網路）。
     基本面: fundamentalsChips(
@@ -9227,13 +9545,34 @@ function renderDetail() {
     ),
   };
   document.getElementById("chartMetrics").innerHTML = (detailMetrics[state.detailTab] || detailMetrics["即時"])
-    .map((metric, index) => `
-      <span class="chart-metric is-${metric.tone || "neutral"} ${index === 4 ? movement : ""}">
+    .map((metric) => `
+      <span class="chart-metric is-${metric.tone || "neutral"}">
         <em>${glossMaybe(metric.label)}</em>
         <strong>${escapeHtml(metric.value)}</strong>
+        ${metric.flag ? `<b class="cm-flag">${escapeHtml(metric.flag)}</b>` : ""}
       </span>
     `)
     .join("");
+  // 狀態／來源／單位這類句子放在格線下方講一次，不佔數字格（會截字，也會長出孤行）。
+  const fundamentalsEntry = fundamentalsState.byCode.get(String(stock.code || "").trim()) || null;
+  const detailNotes = {
+    即時: "",
+    均線: maTabIsDaily ? "" : "資料不足 5 個交易日，暫以盤中樣本計算均價。",
+    法人: institutional
+      ? `${institutionalStatus}・買賣超單位：張`
+      : `${institutionalStatus}・來源 ${institutionalState.source || "TWSE/TPEx"}`,
+    基本面: fundamentalsNote(fundamentalsEntry),
+  };
+  const noteText = detailNotes[state.detailTab] || "";
+  const noteEl = document.getElementById("chartMetricsNote");
+  if (noteEl) {
+    noteEl.textContent = noteText;
+    noteEl.hidden = !noteText;
+    // 載入失敗要比「還沒抓到」顯眼，與格子的 is-warn 同一套判準。
+    const failed = (state.detailTab === "法人" && Boolean(institutionalState.error))
+      || (state.detailTab === "基本面" && Boolean(fundamentalsEntry?.error));
+    noteEl.classList.toggle("is-warn", failed);
+  }
   document.querySelectorAll(".detail-tabs button").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.detailTab === state.detailTab);
   });
@@ -9248,7 +9587,8 @@ function renderDetail() {
       `;
     })
     .join("");
-  const indicatorDetail = buildIndicatorDetail(stock)[state.indicator] || buildIndicatorDetail(stock)[indicatorLabels[0]];
+  const indicatorDetails = buildIndicatorDetail(stock);
+  const indicatorDetail = indicatorDetails[state.indicator] || indicatorDetails[indicatorLabels[0]];
   document.getElementById("indicatorDetail").innerHTML = `
     <header class="is-${escapeHtml(indicatorDetail.statusTone || "neutral")}">
       <div>
@@ -9397,7 +9737,9 @@ function ensureFundamentals(code) {
     .finally(() => {
       next.loading = false;
       next.at = Date.now();
-      render();
+      // 這是背景載入的回呼，使用者可能正在「更多 → 帳號管理」打密碼或券商金鑰。
+      // 一般 render() 會重建 active screen 並清掉未送出草稿；背景重繪一律走受保護版本。
+      renderLiveDataUpdate();
     });
   return next;
 }
@@ -9411,17 +9753,29 @@ function formatRevenueYi(thousandTwd) {
   return `${Math.round(thousandTwd / 10).toLocaleString("zh-TW")} 萬`;
 }
 
+// 基本面分頁的註腳：狀態／來源這類句子不放進數字格。
+// 刻意與 fundamentalsChips 分開回傳，不改它的簽章（既有測試直接驗那個陣列的長度與內容）。
+function fundamentalsNote(entry) {
+  if (entry?.data) return "";
+  if (entry?.loading) return "基本面載入中";
+  if (entry?.error) return "基本面載入失敗，稍後會自動重試。";
+  return "尚未取得基本面資料。";
+}
+
 // detail panel「基本面」籤的 5 顆 chip（獨立函式方便測試）。
 function fundamentalsChips(entry) {
   const f = entry?.data;
   if (!f) {
-    const status = entry?.loading ? "基本面載入中" : entry?.error ? "載入失敗" : "--";
+    // 沒有資料時全部走 na 灰。舊寫法在無資料時反而顏色最花（紅／綠／黃／紫），
+    // 錯誤訊息完全不突出。「狀態」是句子不是數字（實測「基本面載入中」在 111px 格子裡溢出 21px），
+    // 已移到格線下方的註腳（見 fundamentalsNote）；這裡改成與有資料分支一一對應的 5 格，
+    // 切分頁時格子不會跳。
     return [
-      { label: "狀態", value: status, tone: "neutral" },
-      { label: "月營收", value: "N/A", tone: "high" },
-      { label: "EPS", value: "N/A", tone: "low" },
-      { label: "本益比", value: "N/A", tone: "volume" },
-      { label: "殖利率", value: "N/A", tone: "total" },
+      { label: "月營收", value: "N/A", tone: "na" },
+      { label: "營收YoY", value: "N/A", tone: "na" },
+      { label: "EPS", value: "N/A", tone: "na" },
+      { label: "本益比", value: "N/A", tone: "na" },
+      { label: "殖利率", value: "N/A", tone: "na" },
     ];
   }
   const rev = f.revenue?.latest;
@@ -9429,10 +9783,15 @@ function fundamentalsChips(entry) {
   const val = f.valuation;
   return [
     { label: rev ? `${Number(rev.yearMonth.slice(5, 7))}月營收` : "月營收", value: rev ? formatRevenueYi(rev.revenue) : "--", tone: "neutral" },
-    { label: "營收YoY", value: Number.isFinite(rev?.yoy) ? formatSignedPercent(rev.yoy) : "--", tone: "high" },
-    { label: eps ? `EPS ${eps.period.slice(4)}` : "EPS", value: eps ? formatNumber(eps.eps) : "--", tone: "low" },
-    { label: "本益比", value: Number.isFinite(val?.pe) ? formatNumber(val.pe) : "--", tone: "volume" },
-    { label: "殖利率", value: Number.isFinite(val?.dividendYield) ? `${formatNumber(val.dividendYield)}%` : "--", tone: "total" },
+    // 營收 YoY 有正負，紅綠必須跟著值走。舊寫法寫死紅，於是「▼15.30%」是紅色的
+    // ——箭頭說衰退、顏色說成長，兩個編碼互相打臉。現在 ▲▼ 與色相永遠同向。
+    { label: "營收YoY", value: Number.isFinite(rev?.yoy) ? formatSignedPercent(rev.yoy) : "--", tone: metricToneFromNet(rev?.yoy) },
+    // EPS 是水準值，本身不上色；但虧損（負 EPS）是有方向的事實，值得標出來。
+    // 舊寫法寫死綠，賺錢與賠錢同色。
+    { label: eps ? `EPS ${eps.period.slice(4)}` : "EPS", value: eps ? formatNumber(eps.eps) : "--", tone: finiteNumberOrNull(eps?.eps) === null ? "na" : Number(eps.eps) < 0 ? "down" : "neutral" },
+    // 本益比與殖利率的「高低算好算壞」是主觀判斷，沒有可依據的門檻（也不得新增）→ 不上色。
+    { label: "本益比", value: Number.isFinite(val?.pe) ? formatNumber(val.pe) : "--", tone: Number.isFinite(val?.pe) ? "neutral" : "na" },
+    { label: "殖利率", value: Number.isFinite(val?.dividendYield) ? `${formatNumber(val.dividendYield)}%` : "--", tone: Number.isFinite(val?.dividendYield) ? "neutral" : "na" },
   ];
 }
 
@@ -9489,8 +9848,28 @@ function renderFundamentalsPanel() {
     : dividendFreshness === "stale"
       ? "沿用資料中未見近期除權息"
       : "近期無除權息";
+  // 現金與配股**不是互斥的**——「除權息」本來就是兩者都有。舊寫法是三元式，
+  // 只要有現金就不顯示配股：6944 是配股 30%＋息 17 元（參考價 1030→779），
+  // 畫面卻只寫「現金 17 元」，配股 30% 完全看不到 → 使用者不會去補登除權配股紀錄
+  // → 帳本的股數就會一直少（而漏登的後果不只是假虧損，是之後想賣會被賣超檢查擋下）。
+  //
+  // 比率一律同時給百分比與「每仟股 N 股」：官方 OpenAPI 回的是比率（0.1），
+  // 但同一份報表的網頁版是以每仟股股數呈現，只印裸的 0.1 會讓人不知道單位（見 D-41）。
+  const ratioText = (ratio) => `${formatNumber(ratio * 100)}%（每仟股 ${formatNumber(ratio * 1000)} 股）`;
+  const divParts = [];
+  if (Number.isFinite(nextDiv?.cashDividend) && nextDiv.cashDividend > 0) {
+    divParts.push(`現金 ${formatNumber(nextDiv.cashDividend)} 元`);
+  }
+  if (Number.isFinite(nextDiv?.stockRatio) && nextDiv.stockRatio > 0) {
+    divParts.push(`配股 ${ratioText(nextDiv.stockRatio)}`);
+  }
+  if (Number.isFinite(nextDiv?.subscriptionRatio) && nextDiv.subscriptionRatio > 0) {
+    const price = Number.isFinite(nextDiv.subscriptionPrice) && nextDiv.subscriptionPrice > 0
+      ? `＠${formatNumber(nextDiv.subscriptionPrice)} 元` : "";
+    divParts.push(`現增 ${ratioText(nextDiv.subscriptionRatio)}${price}`);
+  }
   const divRows = nextDiv
-    ? `<div class="fund-row"><span>${escapeHtml(nextDiv.kind || "除權息")} ${nextDiv.exDate ? `${nextDiv.exDate.slice(4, 6)}/${nextDiv.exDate.slice(6, 8)}` : ""}</span><b>${Number.isFinite(nextDiv.cashDividend) && nextDiv.cashDividend > 0 ? `現金 ${formatNumber(nextDiv.cashDividend)} 元` : Number.isFinite(nextDiv.stockRatio) && nextDiv.stockRatio > 0 ? `配股 ${formatNumber(nextDiv.stockRatio)}` : "--"}</b></div>`
+    ? `<div class="fund-row"><span>${escapeHtml(nextDiv.kind || "除權息")} ${nextDiv.exDate ? `${nextDiv.exDate.slice(4, 6)}/${nextDiv.exDate.slice(6, 8)}` : ""}</span><b>${divParts.length ? escapeHtml(divParts.join("・")) : "--"}</b></div>`
     : `<div class="fund-row is-empty">${emptyDividendText}</div>`;
   const yoyDirection = signedDirection(rev?.yoy);
   const yoyBadge = Number.isFinite(rev?.yoy)
@@ -9509,7 +9888,18 @@ function renderFundamentalsPanel() {
       <strong>基本面</strong>
       <span class="fund-asof">${escapeHtml(asOfBits)}</span>
     </div>
-    ${f.warnings?.length ? `<p class="fund-hint is-warn">${escapeHtml(f.warnings[0])}</p>` : ""}
+    ${(() => {
+      // 只印第 1 則會漏掉最重要的那則。buildFundamentals 是把「比率量級異常」（疑似上游把
+      // 單位從比率改成每仟股股數，會讓整段 K 線塌陷）unshift 到最前面**之後**，
+      // 才 unshift 各來源的新鮮度警告——於是那條 D-41 的防護網被擠到 index 1，
+      // 在最需要它的時候顯示不出來。改成比照 renderDataTrustCompact：前 2 則＋剩餘則數，
+      // 完整清單放 title。
+      const warnings = f.warnings || [];
+      if (!warnings.length) return "";
+      const shown = warnings.slice(0, 2).join("；");
+      const rest = warnings.length > 2 ? `（另有 ${warnings.length - 2} 則）` : "";
+      return `<p class="fund-hint is-warn" title="${escapeHtml(warnings.join("\n"))}">${escapeHtml(shown)}${rest}</p>`;
+    })()}
     <div class="fund-grid">
       <div class="fund-block fund-block-rev">
         <header>月營收 ${yoyBadge}</header>
@@ -9848,8 +10238,8 @@ function renderWatchBrief() {
         </div>
         <div class="wb-stat">
           <span>最新最強</span>
-          <strong>${strongest ? strongest.name : "--"}</strong>
-          <em class="${strongestTone}">${strongest ? strongest.changeText : "尚無資料"}</em>
+          <strong>${strongest ? escapeHtml(strongest.name) : "--"}</strong>
+          <em class="${strongestTone}">${strongest ? escapeHtml(strongest.changeText) : "尚無資料"}</em>
         </div>
       </div>
     </div>
@@ -10067,7 +10457,6 @@ function render({ preserveLiveDrafts = false, restoreFocus = false } = {}) {
       // 無法寫入儲存空間時忽略，只是下次開啟不會記住。
     }
   }
-  syncStockWatchFlags();
   updateActiveNav();
   if (!preserveActiveScreen) renderActiveScreen();
   const filterButton = document.getElementById("filterOpen");
@@ -10334,6 +10723,10 @@ document.addEventListener("click", (event) => {
   }
   const loadMore = event.target.closest("[data-trade-load-more]");
   if (loadMore) {
+    // 必須先 blur：真實瀏覽器點擊會把焦點留在這顆 button 上，而 renderHoldingsPanel()
+    // 遇到 panel 內有 activeElement 就會 early-return（保護表單輸入），畫面因此完全不動。
+    // jsdom 的 .click() 不移動焦點，所以既有測試看不出來。其餘同層 handler 都已 blur。
+    loadMore.blur();
     tradesHistoryLimit = Math.min(tradesState.records.length, tradesHistoryLimit + 40);
     renderHoldingsPanel();
     return;
@@ -10342,6 +10735,30 @@ document.addEventListener("click", (event) => {
   if (removeBtn) {
     removeBtn.blur();
     removeTradeRecord(removeBtn.dataset.tradeRemove);
+    return;
+  }
+  const caQuick = event.target.closest("[data-corporate-action-quick]");
+  if (caQuick) {
+    // 必須先 blur：renderHoldingsPanel 遇到 panel 內有 activeElement 就會 early-return，
+    // 沒 blur 的話畫面完全不動（「載入更多」踩過同一個坑）。
+    caQuick.blur();
+    if (!tradesState.mutating) {
+      caQuick.disabled = true;
+      caQuick.setAttribute("aria-busy", "true");
+      caQuick.textContent = "儲存除權配股中…";
+    }
+    const exDate = caQuick.dataset.exDate;
+    addTradeRecord({
+      id: `ca-${caQuick.dataset.code}-${exDate}`,
+      code: caQuick.dataset.code,
+      side: "corporateAction",
+      date: exDate,
+      tradeDate: exDate,
+      stockRatio: Number(caQuick.dataset.stockRatio) || 0,
+      subscriptionRatio: Number(caQuick.dataset.subscriptionRatio) || 0,
+      subscriptionPrice: Number(caQuick.dataset.subscriptionPrice) || 0,
+      createdAt: new Date().toISOString(),
+    });
     return;
   }
   const divQuick = event.target.closest("[data-dividend-quick]");
@@ -11324,7 +11741,7 @@ const GLOSSARY = [
   { term: "注意股 / 處置股", aliases: ["注意股", "處置股", "分盤交易"], cat: "風險與制度", def: "證交所對股價／週轉異常的股票發布「<strong>注意</strong>」（只是提醒、無交易限制），情節更重會「<strong>處置</strong>」——常需<strong>分盤集合競價</strong>（每 5 或 20 分才撮合）、<strong>預收全額款券</strong>、多半<strong>不能當沖</strong>。本 App 的選股清單<strong>會顯示並標示</strong>這些股票（可在『更多 → 風險規則』切換隱藏），讓你知情而非靜默濾掉。" },
   { term: "變更交易 / 全額交割", aliases: ["變更交易", "全額交割"], cat: "風險與制度", def: "財務或經營有疑慮被列管的股票，買進要先<strong>全額付款</strong>（全額交割）。風險高；本 App 會<strong>保留並醒目標示</strong>，讓你自行判斷，也可在風險規則中切換隱藏。" },
   { term: "彈性面額股（股名帶 *）", aliases: ["彈性面額", "星號", "*"], cat: "風險與制度", def: "股名後的「<strong>*</strong>」是官方標記「每股面額不是新台幣 10 元」的股票，<strong>不是錯字、也不是風險警示</strong>。它的股價高低不能直接和一般股（面額 10 元）相比，要看市值才準。" },
-  { term: "還原股價（除權息）", aliases: ["還原股價", "除權息", "除息", "除權"], cat: "風險與制度", def: "除權息當天股價會因配息／配股產生制度性跳空，<strong>不等於真的大跌</strong>。App 優先用官方現金股利、股票股利與現增資料還原歷史價；舊區段若只有大跳空可推估，會明示「<strong>疑似／估算還原</strong>」，不把推測冒充官方事件。官方公告欄位未齊時，策略雷達會暫停該檔判定，避免錯算均線。" },
+  { term: "還原股價（除權息）", aliases: ["還原股價", "除權息", "除息", "除權"], cat: "風險與制度", def: "除權息當天股價會因配息／配股產生制度性跳空，<strong>不等於真的大跌</strong>。App 優先用官方現金股利、股票股利與現增資料還原歷史價；舊區段若只有大跳空可推估，會明示「<strong>疑似／估算還原</strong>」，不把推測冒充官方事件。官方公告欄位未齊時，策略雷達會暫停該檔判定，避免錯算均線。<br><strong>偵測範圍的界線</strong>：官方只提供除權息的機器可讀資料，<strong>沒有減資、面額變更、股票分割的端點</strong>。這幾類事件靠「跳空超過 10.5%」推估——減資 10% 以上與所有股票分割都會被抓到並標成估算，但<strong>幅度小於 10.5% 的減資偵測不到</strong>，那段圖會保留原始跳空。所以技術分析頁寫「沒有偵測到公司行動」是指<strong>沒查到</strong>，不是保證沒發生。" },
   { term: "流動性", aliases: ["流動性", "滑價", "低流動性"], cat: "風險與制度", def: "一檔股票好不好買賣、進出會不會大幅影響價格。量太小（低流動性）容易<strong>滑價</strong>、想賣卻賣不掉，不適合波段，所以策略雷達只掃<strong>流動性前 240 檔</strong>（這 240 檔依當日成交量<strong>每個交易日重選</strong>，不是固定名單）。" },
 ];
 const glossaryState = { cat: "", q: "" };
