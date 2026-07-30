@@ -11,6 +11,23 @@ export function compactToday(offsetDays = 0) {
   const d = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day) + offsetDays));
   return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
 }
+// 交易日位移（週末感知）。compactToday 是純日曆位移，對「備份檔名用今天」「不可填未來成交日」
+// 這類測試才正確；但**前向驗證類**測試的前提是「今天是交易日、昨天是上一個交易日」，
+// 用日曆位移在週六日會產生無效前提（引擎正確地回 pending，測試卻期待 win）→ 每個週末整套轉紅。
+// 這裡只跳過週六日：offset 0 = 最近一個平日（週末往回退到週五），負數往前數 N 個平日。
+// 國定假日仍由各測試自行 mock holidaySchedule 決定，不在這裡猜。
+export function compactTradingDay(offsetTradingDays = 0) {
+  const parts = Object.fromEntries(taipeiDateFormatter.formatToParts(new Date()).map((part) => [part.type, part.value]));
+  const d = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)));
+  const isWeekend = (date) => date.getUTCDay() === 0 || date.getUTCDay() === 6;
+  while (isWeekend(d)) d.setUTCDate(d.getUTCDate() - 1);
+  const step = offsetTradingDays >= 0 ? 1 : -1;
+  for (let moved = 0; moved < Math.abs(offsetTradingDays); moved += 1) {
+    do { d.setUTCDate(d.getUTCDate() + step); } while (isWeekend(d));
+  }
+  return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
 // "20260702" → "115/07/02"（TWSE 處置期間格式）
 export function rocSlash(compact) {
   return `${Number(compact.slice(0, 4)) - 1911}/${compact.slice(4, 6)}/${compact.slice(6, 8)}`;
@@ -305,10 +322,13 @@ export const taifexDailyRow = ({ last = 22800, change = -50, pct = "-0.22%", dat
 // ---- 三大法人買賣超（陣列列；索引 1:1 對齊 normalizeTwse/TpexInstitutionalRow）----
 // TWSE T86：19 欄（0 代號、1 名稱、2-4 外資買/賣/淨、5-7 外資自營、8-10 投信、11 自營淨、
 // 12-14 自營自行、15-17 自營避險、18 合計）。數字帶千分位（官方格式）。
-export const t86Row = ({ code, name, foreignNet = 1000000, trustNet = 500000, dealerNet = -200000, totalNet = 1300000 } = {}) => [
+// 官方 T86：row[4] 外陸資（**不含**外資自營商）、row[7] 外資自營商、row[10] 投信、row[11] 自營商、
+// row[18] 三大法人合計（**含**外資自營商）。foreignDealerNet 以前寫死 "0"，測試因此看不出
+// 「四格相加 ≠ 合計」這個差異（D-32），改為可帶入並讓預設值反映真實恆等式。
+export const t86Row = ({ code, name, foreignNet = 1000000, foreignDealerNet = 30000, trustNet = 500000, dealerNet = -200000, totalNet = 1330000 } = {}) => [
   code, name || `測${code}`,
   "5,000,000", "4,000,000", Number(foreignNet).toLocaleString("en-US"),
-  "0", "0", "0",
+  "0", "0", Number(foreignDealerNet).toLocaleString("en-US"),
   "800,000", "300,000", Number(trustNet).toLocaleString("en-US"),
   Number(dealerNet).toLocaleString("en-US"),
   "100,000", "250,000", "-150,000",
